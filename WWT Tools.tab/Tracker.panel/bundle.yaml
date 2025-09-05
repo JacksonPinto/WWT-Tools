@@ -1,6 +1,0 @@
- layout:
-  - Start Timer.pushbutton
-  - Stop Timer.pushbutton
-  - Manual Entry.pushbutton
-  - Settings.pushbutton
-  - Show CSV.pushbutton
