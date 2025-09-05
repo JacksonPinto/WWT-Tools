@@ -1,0 +1,7 @@
+tooltip: 
+ This script allows users to duplicate existing Revit views as dependent views using pyRevit. 
+ Users can input multiple view names via a pop-up window, and the script will create one dependent 
+ view for each name entered.
+ 
+author: 
+ Jackson Pinto.

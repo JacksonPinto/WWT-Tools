@@ -1,0 +1,4 @@
+name: Floor By Room
+tooltip: Only rooms visible in the active view will be processed. The script will skip rooms that do not have valid boundaries or are not properly enclosed. If you have rooms on different levels, the script will use each room's level for its floor.
+author: Jackson Pinto
+version: 0.0.1

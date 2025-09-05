@@ -1,0 +1,4 @@
+name: Camera Adjust
+tooltip: Find all 3D views (cameras) in the model. Let the user choose aspect ratio (4:3 or 16:9) and set the crop region height. Automatically adjust each camera’s crop region so all have the same aspect ratio and height (width is calculated).
+author: Jackson Pinto
+version: 0.0.1

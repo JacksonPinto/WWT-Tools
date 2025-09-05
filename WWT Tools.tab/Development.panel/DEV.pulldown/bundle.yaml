@@ -1,0 +1,15 @@
+title:
+  en_us: DEV
+Tooltip:
+  Tools in development. DO NOT USE while in the development area!
+layout:
+  - DEV SCR
+  - Set Family Param
+  - Units Converter
+  - Floor By Room
+  - Camera Adjust
+  - Family Solid Copy
+  - ReNumber
+  - Circuit Path
+  - Cable Length Calculation
+  - Get Fitting Point

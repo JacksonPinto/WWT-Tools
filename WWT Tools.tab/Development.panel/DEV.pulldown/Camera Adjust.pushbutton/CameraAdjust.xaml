@@ -1,0 +1,62 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Camera Adjust" Height="730" Width="800" WindowStartupLocation="CenterScreen" ResizeMode="NoResize">
+    <DockPanel Margin="10">
+        <StackPanel DockPanel.Dock="Top" Orientation="Vertical" Margin="0,0,0,10">
+            <TextBlock Text="Filter Cameras:" Margin="0,0,0,3"/>
+            <TextBox x:Name="filterBox" Width="300" Margin="0,0,0,12"/>
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                <StackPanel Orientation="Vertical" Margin="0,0,20,0">
+                    <TextBlock Text="Crop Height (mm):" Margin="0,0,0,5"/>
+                    <TextBox x:Name="heightBox" Width="110" Text="5000"/>
+                </StackPanel>
+                <StackPanel Orientation="Vertical" Margin="0,0,20,0">
+                    <TextBlock Text="Aspect Ratio:" Margin="0,0,0,5"/>
+                    <ComboBox x:Name="aspectCombo" SelectedIndex="0" Width="110">
+                        <ComboBoxItem>4:3</ComboBoxItem>
+                        <ComboBoxItem>16:9</ComboBoxItem>
+                    </ComboBox>
+                </StackPanel>
+                <StackPanel Orientation="Vertical" Margin="0,0,20,0">
+                    <TextBlock Text="Far Clip:" Margin="0,0,0,5"/>
+                    <CheckBox x:Name="farClipBox" IsChecked="True" Content="Enable Far Clip"/>
+                </StackPanel>
+                <StackPanel Orientation="Vertical" Margin="0,0,20,0">
+                    <TextBlock Text="Target Elevation (mm):" Margin="0,0,0,5"/>
+                    <TextBox x:Name="targetElevationBox" Width="110" Text="1900"/>
+                </StackPanel>
+                <StackPanel Orientation="Vertical" VerticalAlignment="Bottom">
+                    <TextBlock Text=" " Height="20"/>
+                    <StackPanel Orientation="Horizontal">
+                        <Button x:Name="selectAllButton" Width="90" Margin="0,0,10,0" Content="Select All"/>
+                        <Button x:Name="selectNoneButton" Width="90" Content="Select None"/>
+                    </StackPanel>
+                </StackPanel>
+            </StackPanel>
+        </StackPanel>
+        <TextBlock DockPanel.Dock="Top" Text="3D Cameras in Model:" FontWeight="Bold" Margin="0,0,0,4"/>
+        <ScrollViewer Height="500" DockPanel.Dock="Top">
+            <DataGrid x:Name="CameraGrid" AutoGenerateColumns="False" CanUserAddRows="False" HeadersVisibility="Column" SelectionMode="Extended">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Camera View Name" Binding="{Binding ViewName}" IsReadOnly="True" Width="*"/>
+                    <DataGridCheckBoxColumn Header="Adjust" Binding="{Binding IsSelected, Mode=TwoWay}" Width="60"/>
+                    <!-- ComboBox for View Template -->
+                    <DataGridTemplateColumn Header="View Template" Width="180">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <ComboBox ItemsSource="{Binding ViewTemplates}" 
+                                          SelectedItem="{Binding SelectedViewTemplate, Mode=TwoWay}" 
+                                          DisplayMemberPath="Name"
+                                          Width="160"/>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                </DataGrid.Columns>
+            </DataGrid>
+        </ScrollViewer>
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+            <Button x:Name="okButton" Width="80" Margin="0,0,10,0" IsDefault="True" Content="OK"/>
+            <Button x:Name="cancelButton" Width="80" IsCancel="True" Content="Cancel"/>
+        </StackPanel>
+    </DockPanel>
+</Window>

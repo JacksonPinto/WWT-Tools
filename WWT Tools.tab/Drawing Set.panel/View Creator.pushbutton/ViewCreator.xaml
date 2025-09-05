@@ -1,0 +1,28 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        ShowInTaskbar="False"
+        Width="600" Height="500" ResizeMode="CanResizeWithGrip"
+        WindowStartupLocation="CenterScreen"
+        HorizontalContentAlignment="Center"
+        Title="Batch View Duplicator">
+    <DockPanel Margin="10">
+        <TextBlock DockPanel.Dock="Top">
+            Enter the list of views to duplicate in this format:<LineBreak />
+            <Bold>view-name</Bold>  TAB  <Bold>new-view-name</Bold> (e.g. Floor Plan 1 <Run FontSize="18" Text="⇥"/> New Floor Plan)<LineBreak />
+            Each line represents a separate duplicate operation.
+        </TextBlock>
+        <StackPanel DockPanel.Dock="Bottom">
+            <Button Content="Duplicate Views" Margin="0,10,0,0"
+                    Height="24"
+                    Click="duplicate_views"/>
+        </StackPanel>
+        <TextBox x:Name="views_tb"
+                 AcceptsReturn="True"
+                 AcceptsTab="True"
+                 Margin="0 10 0 0"
+                 FontFamily="Courier New" FontSize="14"
+                 ScrollViewer.CanContentScroll="True"
+                 ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                 ScrollViewer.VerticalScrollBarVisibility="Auto"/>
+    </DockPanel>
+</Window>

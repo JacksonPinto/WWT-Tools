@@ -1,0 +1,28 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Map Rooms to Floor Types" Height="600" Width="750" WindowStartupLocation="CenterScreen" ResizeMode="CanResize">
+    <StackPanel Margin="10">
+        <TextBlock Text="Select rooms and assign a floor type:" FontWeight="Bold" Margin="0,0,0,10"/>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" Margin="0,0,0,10">
+            <Button x:Name="selectAllButton" Width="100" Margin="0,0,10,0" Content="Select All"/>
+            <Button x:Name="selectNoneButton" Width="100" Content="Select None"/>
+        </StackPanel>
+        <ScrollViewer Height="400">
+            <DataGrid x:Name="RoomGrid" AutoGenerateColumns="False" CanUserAddRows="False" HeadersVisibility="Column" SelectionMode="Extended">
+                <DataGrid.Columns>
+                    <DataGridCheckBoxColumn Header="Select" Binding="{Binding IsSelected, Mode=TwoWay}" Width="60"/>
+                    <DataGridTextColumn Header="Room Number" Binding="{Binding RoomNumber}" IsReadOnly="True" Width="100"/>
+                    <DataGridTextColumn Header="Room Name" Binding="{Binding RoomName}" IsReadOnly="True" Width="200"/>
+                    <DataGridComboBoxColumn Header="Floor Type"
+                        SelectedItemBinding="{Binding SelectedFloorType, Mode=TwoWay}"
+                        Width="*"
+                        ItemsSource="{Binding FloorTypes}"/>
+                </DataGrid.Columns>
+            </DataGrid>
+        </ScrollViewer>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+            <Button x:Name="okButton" Width="80" Margin="0,0,10,0" IsDefault="True" Content="OK"/>
+            <Button x:Name="cancelButton" Width="80" IsCancel="True" Content="Cancel"/>
+        </StackPanel>
+    </StackPanel>
+</Window>
