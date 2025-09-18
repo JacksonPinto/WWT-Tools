@@ -1,19 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Bulk Insert Shared Parameters for Revit 2025+ (GroupTypeId API)
-
-- Compatible with Revit 2025 and newer (uses GroupTypeId, not BuiltInParameterGroup)
-- Scans the shared parameters file currently set in Revit (Application.SharedParametersFilename).
-- Shows all shared parameters (API, not text parsing!) in a table UI.
-- Lets you select which to add, set group and instance/type per parameter.
-- Robustly handles missing GroupTypeId properties.
+Bulk Insert Shared Parameters for Revit 2025+ (GroupTypeId API, robust for missing properties)
 """
 
 from Autodesk.Revit.DB import GroupTypeId, Transaction
 from pyrevit import revit, forms, script
 import os
 
-# Only GroupTypeId props that exist in Revit 2025/2026 API (see https://www.revitapidocs.com/2026/)
 GROUP_BIP_LOOKUP = {
     "Constraints": GroupTypeId.Constraints,
     "Construction": GroupTypeId.Construction,
@@ -23,23 +16,22 @@ GROUP_BIP_LOOKUP = {
     "Graphics": GroupTypeId.Graphics,
     "Identity Data": GroupTypeId.IdentityData,
     "Materials and Finishes": GroupTypeId.Materials,
-    "Model Properties": getattr(GroupTypeId, "ModelProperties", GroupTypeId.Other),
-    "Other": GroupTypeId.Other,
-    "Phasing": getattr(GroupTypeId, "Phasing", GroupTypeId.Other),
-    "Structural": getattr(GroupTypeId, "Structural", GroupTypeId.Other),
+    "Model Properties": getattr(GroupTypeId, "ModelProperties", GroupTypeId.Invalid),
+    "Phasing": getattr(GroupTypeId, "Phasing", GroupTypeId.Invalid),
+    "Structural": getattr(GroupTypeId, "Structural", GroupTypeId.Invalid),
     "Text": GroupTypeId.Text,
     "Title Text": GroupTypeId.Title,
     "Visibility": GroupTypeId.Visibility,
+    # Fallback for unmapped: GroupTypeId.Invalid
 }
-GROUP_NAMES = list(GROUP_BIP_LOOKUP.keys())
+GROUP_NAMES = list(GROUP_BIP_LOOKUP.keys()) + ["Invalid"]
 
 def get_sharedparams_api_groups_and_defs(sp_file):
-    """Returns list of dicts with shared param info using only Revit API."""
     params = []
     if not sp_file:
         return params
     for group in sp_file.Groups:
-        group_name = group.Name  # e.g. "InfoComm"
+        group_name = group.Name
         for definition in group.Definitions:
             try:
                 params.append({
@@ -57,7 +49,7 @@ class ParamRow(forms.TemplateListItem):
     def __init__(self, param):
         super(ParamRow, self).__init__(param)
         self.selected = False
-        self.group = "Other"
+        self.group = "Invalid"
         self.is_instance = False
 
     @property
@@ -149,7 +141,7 @@ def main():
         if not definition:
             results.append(u"Parameter '{}' definition not found.".format(row.name))
             continue
-        group_enum = GROUP_BIP_LOOKUP.get(row.group, GroupTypeId.Other)
+        group_enum = GROUP_BIP_LOOKUP.get(row.group, GroupTypeId.Invalid)
         try:
             fam_param = add_shared_parameter_to_family(doc, definition, group_enum, row.is_instance)
             results.append(u"Added: '{}' as {} under '{}'".format(row.name, "Instance" if row.is_instance else "Type", row.group))
