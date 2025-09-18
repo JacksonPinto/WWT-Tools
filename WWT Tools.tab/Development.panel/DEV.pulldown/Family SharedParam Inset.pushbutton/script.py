@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Bulk Insert Shared Parameters for Revit 2025+ (GroupTypeId API, robust for missing properties)
+Bulk Insert Shared Parameters for Revit 2025+ (GroupTypeId API, robust and minimal group set)
+
+- Compatible with Revit 2025 and newer (uses GroupTypeId, not BuiltInParameterGroup)
+- Only the main parameter groups are available (see GROUP_BIP_LOOKUP).
+- Scans the shared parameters file currently set in Revit (Application.SharedParametersFilename).
+- Lets you select which parameters to add (basic selection UI, compatible with all pyRevit builds).
 """
 
 from Autodesk.Revit.DB import GroupTypeId, Transaction
 from pyrevit import revit, forms, script
 import os
 
+# Minimal group set, robust for all 2025+ APIs
 GROUP_BIP_LOOKUP = {
     "Constraints": GroupTypeId.Constraints,
     "Construction": GroupTypeId.Construction,
@@ -20,9 +26,10 @@ GROUP_BIP_LOOKUP = {
     "Visibility": GroupTypeId.Visibility,
     # Fallback for unmapped: GroupTypeId.Invalid
 }
-GROUP_NAMES = list(GROUP_BIP_LOOKUP.keys()) + ["Invalid"]
+GROUP_NAMES = list(GROUP_BIP_LOOKUP.keys())
 
 def get_sharedparams_api_groups_and_defs(sp_file):
+    """Returns list of dicts with shared param info using only Revit API."""
     params = []
     if not sp_file:
         return params
@@ -41,59 +48,22 @@ def get_sharedparams_api_groups_and_defs(sp_file):
                 continue
     return params
 
-class ParamRow(forms.TemplateListItem):
-    def __init__(self, param):
-        super(ParamRow, self).__init__(param)
-        self.selected = False
-        self.group = "Invalid"
-        self.is_instance = False
-
-    @property
-    def name(self):
-        return self.item["name"]
-
-    @property
-    def group_choices(self):
-        return GROUP_NAMES
-
-    def set_group(self, value):
-        self.group = value
-
-    def set_instance(self, value):
-        self.is_instance = (value == "Yes")
-
-    def values_for_ui(self):
-        return [self.selected,
-                self.name,
-                self.group,
-                "Yes" if self.is_instance else "No"]
-
-    def update_from_ui(self, vals):
-        self.selected = vals[0]
-        self.set_group(vals[2])
-        self.set_instance(vals[3])
-
-def multi_column_table(params):
-    columns = ["Select", "Shared Parameter Name", "Parameter Group", "Instance (Yes/No)"]
-    rows = [ParamRow(p) for p in params]
-    table_data = [r.values_for_ui() for r in rows]
-
-    edited_data = forms.edit_table(
-        columns=columns,
-        data=table_data,
-        title="Bulk Shared Parameter Inserter (Revit 2025+)",
-        description="Check parameters to insert, set group and instance as needed, then press OK."
-    )
-
-    if not edited_data:
+def multi_select_params(params):
+    # Simple selection UI: user picks which parameters to add (no group/type editing)
+    param_names = [u"[{}] {}".format(p["group_name"], p["name"]) for p in params]
+    selected = forms.SelectFromList.show(param_names, multiselect=True, title="Select Shared Parameters to Add")
+    if not selected:
         return []
+    # Map back to params by matching displayed name
+    return [p for p, label in zip(params, param_names) if label in selected]
 
-    selected_rows = []
-    for row, vals in zip(rows, edited_data):
-        row.update_from_ui(vals)
-        if row.selected:
-            selected_rows.append(row)
-    return selected_rows
+def choose_group(default="Data"):
+    # Prompt user to choose a parameter group (default is Data)
+    return forms.ask_for_one_item(GROUP_NAMES, default=default, prompt="Choose Parameter Group:")
+
+def choose_instance_type(default="Instance"):
+    # Prompt user to choose Instance/Type
+    return forms.ask_for_one_item(["Instance", "Type"], default=default, prompt="Should parameter be Instance or Type?")
 
 def add_shared_parameter_to_family(doc, definition, group, is_instance):
     fam_mgr = doc.FamilyManager
@@ -125,24 +95,31 @@ def main():
     if not all_params:
         forms.alert("No parameters found in shared parameters file.", exitscript=True)
 
-    selected_rows = multi_column_table(all_params)
-    if not selected_rows:
+    selected_params = multi_select_params(all_params)
+    if not selected_params:
         forms.alert("No parameters selected.", exitscript=True)
+
+    # Prompt user ONCE for group/instance selection for all (can be improved if you want per-param)
+    chosen_group_name = choose_group()
+    if not chosen_group_name:
+        forms.alert("No group selected.", exitscript=True)
+    group_enum = GROUP_BIP_LOOKUP.get(chosen_group_name, GroupTypeId.Invalid)
+
+    is_instance = choose_instance_type() == "Instance"
 
     t = Transaction(doc, "Add Shared Parameters")
     t.Start()
     results = []
-    for row in selected_rows:
-        definition = row.item["definition"]
+    for param in selected_params:
+        definition = param["definition"]
         if not definition:
-            results.append(u"Parameter '{}' definition not found.".format(row.name))
+            results.append(u"Parameter '{}' definition not found.".format(param["name"]))
             continue
-        group_enum = GROUP_BIP_LOOKUP.get(row.group, GroupTypeId.Invalid)
         try:
-            fam_param = add_shared_parameter_to_family(doc, definition, group_enum, row.is_instance)
-            results.append(u"Added: '{}' as {} under '{}'".format(row.name, "Instance" if row.is_instance else "Type", row.group))
+            fam_param = add_shared_parameter_to_family(doc, definition, group_enum, is_instance)
+            results.append(u"Added: '{}' as {} under '{}'".format(param["name"], "Instance" if is_instance else "Type", chosen_group_name))
         except Exception as ex:
-            results.append(u"Error adding '{}': {}".format(row.name, str(ex)))
+            results.append(u"Error adding '{}': {}".format(param["name"], str(ex)))
     t.Commit()
 
     forms.alert('\n'.join(results), title="Results")
