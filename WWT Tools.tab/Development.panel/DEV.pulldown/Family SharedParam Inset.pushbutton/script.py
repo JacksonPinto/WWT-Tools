@@ -1,52 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-pyRevit Script: Bulk Shared Parameters Insertion for Revit Families
+pyRevit Script: Bulk Insert Shared Parameters from Configured File
 
-Features:
-- Scan any Revit shared parameters file (*.txt) and list all parameters with checkboxes for selection (multi-select).
-- UI for selecting one or more shared parameters to add to current open family document.
-- For each parameter, user can:
-    - Choose to add as Type or Instance parameter.
-    - Choose "Group parameter under" from the list of valid Revit parameter groups.
-- Robust file selection compatible with IronPython, OneDrive, non-ASCII paths, and pyRevit edge cases.
-- Uses pyRevit, Revit API (.NET), and works under IronPython.
+- Uses the shared parameters file currently configured in Revit (Application.SharedParametersFilename).
+- Lists all available shared parameters in that file for user selection (multi-select).
+- Allows bulk insertion of selected parameters into the open family, with type/instance and group options.
+- No file dialog: always uses the configured file for this Revit session.
 
-Author: Jackson Pinto (for pyRevit)
+Author: Jackson Pinto
 """
 
 from pyrevit import revit, DB, forms, script
 import os
-import clr
 
-clr.AddReference('System.Windows.Forms')
-from System.Windows.Forms import OpenFileDialog
-
-__title__ = 'Bulk Shared Params'
+__title__ = 'Bulk SharedParams (Config File)'
 __author__ = 'Jackson Pinto'
-__doc__ = 'Bulk insert shared parameters into Revit Family with type/instance, group selection.'
-
-def select_shared_params_file():
-    dialog = OpenFileDialog()
-    dialog.Title = "Select Shared Parameters File"
-    dialog.Filter = "TXT files (*.txt)|*.txt"
-    dialog.Multiselect = False
-    if dialog.ShowDialog() == 1:
-        filename = dialog.FileName
-        try:
-            filename = str(filename)
-        except Exception:
-            filename = filename.ToString()
-        # Print to pyRevit output for debug
-        from pyrevit import script
-        output = script.get_output()
-        output.print_md("**Selected file:** `{}`".format(filename))
-        # Check actual file existence
-        if os.path.exists(filename):
-            return filename
-        else:
-            forms.alert("File does not exist on disk:\n{}".format(filename))
-            return None
-    return None
 
 def parse_shared_params_file(sp_filepath):
     params = []
@@ -75,7 +43,7 @@ def parse_shared_params_file(sp_filepath):
                     try:
                         _, group_id, group_name = line.split('\t', 2)
                         groups[group_id] = group_name
-                    except:
+                    except Exception:
                         continue
             elif section == 'params':
                 # Format: PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE\tHIDEWHENNOVALUE
@@ -152,6 +120,7 @@ def add_shared_parameter_to_family(doc, definition, group, is_instance):
     return fam_param
 
 def find_definition_by_guid(sp_file, guid):
+    # GUID comparison is case-insensitive
     for group in sp_file.Groups:
         for definition in group.Definitions:
             if str(definition.GUID).lower() == guid.lower():
@@ -162,31 +131,36 @@ def main():
     doc = revit.doc
     if not doc.IsFamilyDocument:
         forms.alert("This script only works in Revit Family Documents.", exitscript=True)
-    # Step 1: Select shared params file
-    sp_filepath = select_shared_params_file()
-    if not sp_filepath:
-        forms.alert("No shared parameters file selected.", exitscript=True)
 
-    # Step 2: Parse file and show parameter selection UI
+    app = doc.Application
+    sp_filepath = app.SharedParametersFilename
+
+    # Defensive: ensure path is string and exists
+    if not sp_filepath or not os.path.exists(sp_filepath):
+        forms.alert(
+            "No shared parameters file is configured in Revit, or the file does not exist.\n"
+            "Set the shared parameters file in Revit (File > Options > File Locations > Shared Parameters), then try again.",
+            exitscript=True
+        )
+
+    # Parse file, list parameters for selection
     all_params = parse_shared_params_file(sp_filepath)
     if not all_params:
-        forms.alert("No parameters found in shared parameters file.", exitscript=True)
+        forms.alert("No parameters found in shared parameters file:\n{}".format(sp_filepath), exitscript=True)
 
     selected_params = select_parameters_ui(all_params)
     if not selected_params:
         forms.alert("No parameters selected.", exitscript=True)
 
-    # Step 3: For each param, get type/instance and group
+    # For each param, get type/instance and group
     param_settings = get_param_settings_ui(selected_params)
 
-    # Step 4: Open shared params file in Revit API (must match filepath)
-    app = doc.Application
-    app.SharedParametersFilename = sp_filepath
+    # Open shared params file in Revit API (must match filepath)
     sp_file = app.OpenSharedParameterFile()
     if not sp_file:
         forms.alert("Could not open shared parameters file via API.", exitscript=True)
 
-    # Step 5: Insert parameters in transaction
+    # Insert parameters in transaction
     t = DB.Transaction(doc, "Add Shared Parameters")
     t.Start()
     results = []
