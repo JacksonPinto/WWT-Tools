@@ -6,12 +6,14 @@ Bulk Insert Shared Parameters for Revit 2025+ (GroupTypeId API)
 - Scans the shared parameters file currently set in Revit (Application.SharedParametersFilename).
 - Shows all shared parameters (API, not text parsing!) in a table UI.
 - Lets you select which to add, set group and instance/type per parameter.
+- Robustly handles missing GroupTypeId properties.
 """
 
 from Autodesk.Revit.DB import GroupTypeId, Transaction
 from pyrevit import revit, forms, script
 import os
 
+# Only GroupTypeId props that exist in Revit 2025/2026 API (see https://www.revitapidocs.com/2026/)
 GROUP_BIP_LOOKUP = {
     "Constraints": GroupTypeId.Constraints,
     "Construction": GroupTypeId.Construction,
@@ -20,34 +22,24 @@ GROUP_BIP_LOOKUP = {
     "General": GroupTypeId.General,
     "Graphics": GroupTypeId.Graphics,
     "Identity Data": GroupTypeId.IdentityData,
-    "IFC Parameters": GroupTypeId.IFC,
     "Materials and Finishes": GroupTypeId.Materials,
-    "Model Properties": GroupTypeId.ADSKModelProperties,
-    "Other": GroupTypeId.Invalid,
+    "Model Properties": getattr(GroupTypeId, "ModelProperties", GroupTypeId.Other),
+    "Other": GroupTypeId.Other,
+    "Phasing": getattr(GroupTypeId, "Phasing", GroupTypeId.Other),
+    "Structural": getattr(GroupTypeId, "Structural", GroupTypeId.Other),
     "Text": GroupTypeId.Text,
     "Title Text": GroupTypeId.Title,
     "Visibility": GroupTypeId.Visibility,
 }
-
-def get_group_names():
-    return list(GROUP_BIP_LOOKUP.keys())
-
-def bip_from_group_name(group_name):
-    return GROUP_BIP_LOOKUP.get(group_name, GroupTypeId.Invalid)
-
-def group_name_from_bip(bip):
-    for k, v in GROUP_BIP_LOOKUP.items():
-        if v == bip:
-            return k
-    return "Other"
+GROUP_NAMES = list(GROUP_BIP_LOOKUP.keys())
 
 def get_sharedparams_api_groups_and_defs(sp_file):
+    """Returns list of dicts with shared param info using only Revit API."""
     params = []
     if not sp_file:
         return params
-
     for group in sp_file.Groups:
-        group_name = group.Name
+        group_name = group.Name  # e.g. "InfoComm"
         for definition in group.Definitions:
             try:
                 params.append({
@@ -74,7 +66,7 @@ class ParamRow(forms.TemplateListItem):
 
     @property
     def group_choices(self):
-        return get_group_names()
+        return GROUP_NAMES
 
     def set_group(self, value):
         self.group = value
@@ -157,7 +149,7 @@ def main():
         if not definition:
             results.append(u"Parameter '{}' definition not found.".format(row.name))
             continue
-        group_enum = bip_from_group_name(row.group)
+        group_enum = GROUP_BIP_LOOKUP.get(row.group, GroupTypeId.Other)
         try:
             fam_param = add_shared_parameter_to_family(doc, definition, group_enum, row.is_instance)
             results.append(u"Added: '{}' as {} under '{}'".format(row.name, "Instance" if row.is_instance else "Type", row.group))
