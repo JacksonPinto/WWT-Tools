@@ -1,0 +1,7 @@
+name: Family Shared Parameter Insertion 
+tooltip: >
+  Bulk insert shared parameters into a Revit Family. 
+  Scan a shared parameters file, select one or multiple parameters to add, 
+  choose Type/Instance and group under options for each parameter.
+author: Jackson Pinto
+version: 1.0.0
