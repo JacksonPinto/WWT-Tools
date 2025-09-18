@@ -1,61 +1,53 @@
 # -*- coding: utf-8 -*-
 """
-Bulk Insert Shared Parameters from Configured File (with Robust API Handling)
+Bulk Insert Shared Parameters for Revit 2025+ (GroupTypeId API)
 
+- Compatible with Revit 2025 and newer (uses GroupTypeId, not BuiltInParameterGroup)
 - Scans the shared parameters file currently set in Revit (Application.SharedParametersFilename).
 - Shows all shared parameters (API, not text parsing!) in a table UI.
 - Lets you select which to add, set group and instance/type per parameter.
-- Handles all import and enum issues.
-- Works in pyRevit and IronPython (requires correct API imports!).
-
-Author: Jackson Pinto & Copilot (2024)
 """
 
-from Autodesk.Revit.DB import BuiltInParameterGroup, Transaction
+from Autodesk.Revit.DB import GroupTypeId, Transaction
 from pyrevit import revit, forms, script
 import os
 
-# --- BuiltInParameterGroup mapping (UI label to BIP enum) ---
 GROUP_BIP_LOOKUP = {
-    "Analysis Results": BuiltInParameterGroup.PG_ANALYSIS_RESULTS,
-    "Constraints": BuiltInParameterGroup.PG_CONSTRAINTS,
-    "Construction": BuiltInParameterGroup.PG_CONSTRUCTION,
-    "Data": BuiltInParameterGroup.PG_DATA,
-    "Dimensions": BuiltInParameterGroup.PG_GEOMETRY,
-    "General": BuiltInParameterGroup.PG_GENERAL,
-    "Graphics": BuiltInParameterGroup.PG_GRAPHICS,
-    "Identity Data": BuiltInParameterGroup.PG_IDENTITY_DATA,
-    "IFC Parameters": BuiltInParameterGroup.PG_IFC,
-    "Materials and Finishes": BuiltInParameterGroup.PG_MATERIALS,
-    "Model Properties": BuiltInParameterGroup.PG_ADSK_MODEL_PROPERTIES,
-    "Other": BuiltInParameterGroup.INVALID,
-    "Text": BuiltInParameterGroup.PG_TEXT,
-    "Title Text": BuiltInParameterGroup.PG_TITLE,
-    "Visibility": BuiltInParameterGroup.PG_VISIBILITY,
+    "Constraints": GroupTypeId.Constraints,
+    "Construction": GroupTypeId.Construction,
+    "Data": GroupTypeId.Data,
+    "Dimensions": GroupTypeId.Geometry,
+    "General": GroupTypeId.General,
+    "Graphics": GroupTypeId.Graphics,
+    "Identity Data": GroupTypeId.IdentityData,
+    "IFC Parameters": GroupTypeId.IFC,
+    "Materials and Finishes": GroupTypeId.Materials,
+    "Model Properties": GroupTypeId.ADSKModelProperties,
+    "Other": GroupTypeId.Invalid,
+    "Text": GroupTypeId.Text,
+    "Title Text": GroupTypeId.Title,
+    "Visibility": GroupTypeId.Visibility,
 }
 
 def get_group_names():
     return list(GROUP_BIP_LOOKUP.keys())
 
 def bip_from_group_name(group_name):
-    # Return the BuiltInParameterGroup enum for a group name string
-    return GROUP_BIP_LOOKUP.get(group_name, BuiltInParameterGroup.INVALID)
+    return GROUP_BIP_LOOKUP.get(group_name, GroupTypeId.Invalid)
 
 def group_name_from_bip(bip):
-    # Return the UI group name for a BuiltInParameterGroup enum value
     for k, v in GROUP_BIP_LOOKUP.items():
         if v == bip:
             return k
     return "Other"
 
 def get_sharedparams_api_groups_and_defs(sp_file):
-    """Returns list of dicts with shared param info using only Revit API."""
     params = []
     if not sp_file:
         return params
 
     for group in sp_file.Groups:
-        group_name = group.Name  # e.g. "InfoComm", "Invisible Parameters"
+        group_name = group.Name
         for definition in group.Definitions:
             try:
                 params.append({
@@ -73,8 +65,8 @@ class ParamRow(forms.TemplateListItem):
     def __init__(self, param):
         super(ParamRow, self).__init__(param)
         self.selected = False
-        self.group = "Other"  # User must choose group for each
-        self.is_instance = False  # Default to No (Type)
+        self.group = "Other"
+        self.is_instance = False
 
     @property
     def name(self):
@@ -109,7 +101,7 @@ def multi_column_table(params):
     edited_data = forms.edit_table(
         columns=columns,
         data=table_data,
-        title="Bulk Shared Parameter Inserter",
+        title="Bulk Shared Parameter Inserter (Revit 2025+)",
         description="Check parameters to insert, set group and instance as needed, then press OK."
     )
 
@@ -127,7 +119,7 @@ def add_shared_parameter_to_family(doc, definition, group, is_instance):
     fam_mgr = doc.FamilyManager
     for fam_param in fam_mgr.Parameters:
         if fam_param.Definition.Name == definition.Name:
-            return fam_param  # Already exists
+            return fam_param
     return fam_mgr.AddParameter(definition, group, is_instance)
 
 def main():
@@ -153,12 +145,10 @@ def main():
     if not all_params:
         forms.alert("No parameters found in shared parameters file.", exitscript=True)
 
-    # Show table UI for parameter selection
     selected_rows = multi_column_table(all_params)
     if not selected_rows:
         forms.alert("No parameters selected.", exitscript=True)
 
-    # Insert parameters in transaction
     t = Transaction(doc, "Add Shared Parameters")
     t.Start()
     results = []
