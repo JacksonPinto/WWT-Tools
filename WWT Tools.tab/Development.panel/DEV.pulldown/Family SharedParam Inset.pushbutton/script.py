@@ -16,11 +16,7 @@ GROUP_BIP_LOOKUP = {
     "Graphics": GroupTypeId.Graphics,
     "Identity Data": GroupTypeId.IdentityData,
     "Materials and Finishes": GroupTypeId.Materials,
-    "Model Properties": getattr(GroupTypeId, "ModelProperties", GroupTypeId.Invalid),
-    "Phasing": getattr(GroupTypeId, "Phasing", GroupTypeId.Invalid),
-    "Structural": getattr(GroupTypeId, "Structural", GroupTypeId.Invalid),
     "Text": GroupTypeId.Text,
-    "Title Text": GroupTypeId.Title,
     "Visibility": GroupTypeId.Visibility,
     # Fallback for unmapped: GroupTypeId.Invalid
 }
