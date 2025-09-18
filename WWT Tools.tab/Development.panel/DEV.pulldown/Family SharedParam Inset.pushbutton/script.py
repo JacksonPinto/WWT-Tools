@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Bulk Insert Shared Parameters for Revit 2025+ (GroupTypeId API, robust and minimal group set, per-parameter Instance selection)
+Bulk Insert Shared Parameters for Revit 2025+ (GroupTypeId API, robust and minimal group set, single Instance selection)
 
 - Compatible with Revit 2025 and newer (uses GroupTypeId, not BuiltInParameterGroup)
 - Only the main parameter groups are available (see GROUP_BIP_LOOKUP).
 - Scans the shared parameters file currently set in Revit (Application.SharedParametersFilename).
 - Lets you select which parameters to add (basic selection UI, compatible with all pyRevit builds).
-- Prompts for Instance/Type per parameter.
+- Prompts ONCE for Instance/Type, your selection is applied for all parameters.
 """
 
 from Autodesk.Revit.DB import GroupTypeId, Transaction
@@ -58,8 +58,8 @@ def multi_select_params(params):
 def choose_group(default="Data"):
     return forms.ask_for_one_item(GROUP_NAMES, default=default, prompt="Choose Parameter Group:")
 
-def choose_instance_type(param_name, default="Instance"):
-    return forms.ask_for_one_item(["Instance", "Type"], default=default, prompt="Should parameter '{}' be Instance or Type?".format(param_name))
+def choose_instance_type(default="Instance"):
+    return forms.ask_for_one_item(["Instance", "Type"], default=default, prompt="Should parameters be Instance or Type?")
 
 def add_shared_parameter_to_family(doc, definition, group, is_instance):
     fam_mgr = doc.FamilyManager
@@ -95,20 +95,15 @@ def main():
     if not selected_params:
         forms.alert("No parameters selected.", exitscript=True)
 
-    # Prompt user ONCE for group selection for all (for simplicity)
     chosen_group_name = choose_group()
     if not chosen_group_name or chosen_group_name not in GROUP_BIP_LOOKUP:
         forms.alert("No group selected, or group not mapped. Defaulting to 'Data'.")
         chosen_group_name = "Data"
     group_enum = GROUP_BIP_LOOKUP[chosen_group_name]
 
-    # Prompt for Instance/Type per parameter
-    param_instance_map = {}
-    for param in selected_params:
-        inst_type = choose_instance_type(param["name"])
-        if inst_type is None:
-            inst_type = "Instance"
-        param_instance_map[param["name"]] = (inst_type == "Instance")
+    # Prompt ONCE for Instance/Type, and use the answer for all parameters
+    inst_type = choose_instance_type()
+    is_instance = (inst_type == "Instance")
 
     t = Transaction(doc, "Add Shared Parameters")
     t.Start()
@@ -118,7 +113,6 @@ def main():
         if not definition:
             results.append(u"Parameter '{}' definition not found.".format(param["name"]))
             continue
-        is_instance = param_instance_map.get(param["name"], True)
         try:
             fam_param = add_shared_parameter_to_family(doc, definition, group_enum, is_instance)
             results.append(u"Added: '{}' as {} under '{}'".format(param["name"], "Instance" if is_instance else "Type", chosen_group_name))
