@@ -3,21 +3,21 @@
 pyRevit Script: Bulk Shared Parameters Insertion for Revit Families
 
 Features:
-- Scan shared parameters file (*.txt) and list all parameters with checkboxes for selection (multi-select).
+- Scan any Revit shared parameters file (*.txt) and list all parameters with checkboxes for selection (multi-select).
 - UI for selecting one or more shared parameters to add to current open family document.
 - For each parameter, user can:
     - Choose to add as Type or Instance parameter.
     - Choose "Group parameter under" from the list of valid Revit parameter groups.
+- Robust file selection compatible with IronPython, OneDrive, non-ASCII paths, and pyRevit edge cases.
 - Uses pyRevit, Revit API (.NET), and works under IronPython.
 
 Author: Jackson Pinto (for pyRevit)
 """
 
 from pyrevit import revit, DB, forms, script
-import clr
 import os
+import clr
 
-# Load Windows Forms for file dialog
 clr.AddReference('System.Windows.Forms')
 from System.Windows.Forms import OpenFileDialog
 
@@ -25,17 +25,29 @@ __title__ = 'Bulk Shared Params'
 __author__ = 'Jackson Pinto'
 __doc__ = 'Bulk insert shared parameters into Revit Family with type/instance, group selection.'
 
-# Helper to open file dialog to select shared params file
 def select_shared_params_file():
     dialog = OpenFileDialog()
     dialog.Title = "Select Shared Parameters File"
     dialog.Filter = "TXT files (*.txt)|*.txt"
     dialog.Multiselect = False
     if dialog.ShowDialog() == 1:
-        return dialog.FileName
+        filename = dialog.FileName
+        try:
+            filename = str(filename)
+        except Exception:
+            filename = filename.ToString()
+        # Print to pyRevit output for debug
+        from pyrevit import script
+        output = script.get_output()
+        output.print_md("**Selected file:** `{}`".format(filename))
+        # Check actual file existence
+        if os.path.exists(filename):
+            return filename
+        else:
+            forms.alert("File does not exist on disk:\n{}".format(filename))
+            return None
     return None
 
-# Parse shared params file, returns list of dicts with name, guid, type, group, etc.
 def parse_shared_params_file(sp_filepath):
     params = []
     if not os.path.exists(sp_filepath):
@@ -43,40 +55,48 @@ def parse_shared_params_file(sp_filepath):
 
     section = None
     groups = {}
-    params_data = []
     with open(sp_filepath, 'r') as f:
         for line in f:
             line = line.strip()
-            if line.startswith('['):
-                section = line.lower()
+            if line.startswith('*'):
+                if 'GROUP' in line.upper():
+                    section = 'groups'
+                elif 'PARAM' in line.upper():
+                    section = 'params'
+                else:
+                    section = None
                 continue
-            if not line or line.startswith('#'):
+            if not line or line.startswith('#') or section is None:
                 continue
-            if section == '[groups]':
-                # Format: ID\tGroupName
-                try:
-                    group_id, group_name = line.split('\t')
-                    groups[group_id] = group_name
-                except:
-                    continue
-            elif section == '[parameters]':
-                # Format: GUID\tName\tGroupID\tType\tDatatype\tVisible\tDesc
-                data = line.split('\t')
-                if len(data) >= 3:
-                    param = {
-                        'guid': data[0],
-                        'name': data[1],
-                        'group_id': data[2],
-                        'type': data[3] if len(data) > 3 else '',
-                        'datatype': data[4] if len(data) > 4 else '',
-                        'visible': data[5] if len(data) > 5 else '',
-                        'desc': data[6] if len(data) > 6 else '',
-                        'group_name': groups.get(data[2], '')
-                    }
-                    params.append(param)
+
+            if section == 'groups':
+                # Format: GROUP\tID\tNAME
+                if line.startswith('GROUP'):
+                    try:
+                        _, group_id, group_name = line.split('\t', 2)
+                        groups[group_id] = group_name
+                    except:
+                        continue
+            elif section == 'params':
+                # Format: PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE\tHIDEWHENNOVALUE
+                if line.startswith('PARAM'):
+                    parts = line.split('\t')
+                    if len(parts) >= 6:
+                        param = {
+                            'guid': parts[1],
+                            'name': parts[2],
+                            'datatype': parts[3],
+                            'datacategory': parts[4],
+                            'group_id': parts[5],
+                            'visible': parts[6] if len(parts) > 6 else '',
+                            'desc': parts[7] if len(parts) > 7 else '',
+                            'usermodifiable': parts[8] if len(parts) > 8 else '',
+                            'hidewhennovalue': parts[9] if len(parts) > 9 else '',
+                            'group_name': groups.get(parts[5], parts[5])
+                        }
+                        params.append(param)
     return params
 
-# Show multi-select checkbox UI for parameter selection
 def select_parameters_ui(params):
     class ParamOption(forms.TemplateListItem):
         @property
@@ -84,7 +104,7 @@ def select_parameters_ui(params):
             return self.item['name']
         @property
         def description(self):
-            return "Type: {} | GUID: {}".format(self.item['datatype'], self.item['guid'])
+            return "Type: {} | GUID: {} | Group: {}".format(self.item['datatype'], self.item['guid'], self.item['group_name'])
 
     param_options = [ParamOption(p) for p in params]
     res = forms.SelectFromList.show(param_options,
@@ -95,20 +115,18 @@ def select_parameters_ui(params):
         return []
     return [x.item for x in res]
 
-# For each selected parameter, get type/instance and group UI
 def get_param_settings_ui(selected_params):
     # Get all built-in parameter groups (Revit API)
-    param_groups = [g for g in DB.BuiltInParameterGroup]
+    param_groups = [g for g in DB.BuiltInParameterGroup if g != DB.BuiltInParameterGroup.INVALID]
     group_names = [DB.LabelUtils.GetLabelFor(g) for g in param_groups]
     settings = []
     for param in selected_params:
         # Ask user for Type/Instance and group
-        values = forms.CommandSwitchWindow.show(
+        paramtype_choice = forms.CommandSwitchWindow.show(
             ['Instance', 'Type'],
             message="Insert parameter '{}' as:".format(param['name']),
             default='Instance'
         )
-        param_type = DB.BuiltInParameterGroup.INVALID
         group_choice = forms.SelectFromList.show(
             group_names,
             title="Group parameter '{}' under:".format(param['name']),
@@ -116,32 +134,31 @@ def get_param_settings_ui(selected_params):
         )
         if not group_choice:
             group_choice = group_names[0]
-        # Map group name back to BuiltInParameterGroup enum
         group_enum = param_groups[group_names.index(group_choice)]
-
         settings.append({
             'param': param,
-            'is_instance': (values == 'Instance'),
+            'is_instance': (paramtype_choice == 'Instance'),
             'group': group_enum
         })
     return settings
 
-# Actual insertion of shared parameter
 def add_shared_parameter_to_family(doc, definition, group, is_instance):
-    app = doc.Application
     fam_mgr = doc.FamilyManager
-
-    # Need to check if param already exists
+    # Check if param already exists
     for fam_param in fam_mgr.Parameters:
         if fam_param.Definition.Name == definition.Name:
             return fam_param # Already exists
-
     fam_param = fam_mgr.AddParameter(definition, group, is_instance)
     return fam_param
 
-# Main Routine
+def find_definition_by_guid(sp_file, guid):
+    for group in sp_file.Groups:
+        for definition in group.Definitions:
+            if str(definition.GUID).lower() == guid.lower():
+                return definition
+    return None
+
 def main():
-    # Only works for family documents
     doc = revit.doc
     if not doc.IsFamilyDocument:
         forms.alert("This script only works in Revit Family Documents.", exitscript=True)
@@ -169,12 +186,6 @@ def main():
     if not sp_file:
         forms.alert("Could not open shared parameters file via API.", exitscript=True)
 
-    # Create a map for guid to Definition
-    guid2def = {}
-    for group in sp_file.Groups:
-        for definition in group.Definitions:
-            guid2def[str(definition.GUID)] = definition
-
     # Step 5: Insert parameters in transaction
     t = DB.Transaction(doc, "Add Shared Parameters")
     t.Start()
@@ -184,18 +195,17 @@ def main():
         is_instance = setting['is_instance']
         group_enum = setting['group']
 
-        definition = guid2def.get(param['guid'], None)
+        definition = find_definition_by_guid(sp_file, param['guid'])
         if not definition:
-            results.append("Parameter '{}' not found in API file.".format(param['name']))
+            results.append(u"Parameter '{}' not found in API file.".format(param['name']))
             continue
         try:
             fam_param = add_shared_parameter_to_family(doc, definition, group_enum, is_instance)
-            results.append("Added: '{}' as {} under '{}'".format(param['name'], "Instance" if is_instance else "Type", DB.LabelUtils.GetLabelFor(group_enum)))
+            results.append(u"Added: '{}' as {} under '{}'".format(param['name'], "Instance" if is_instance else "Type", DB.LabelUtils.GetLabelFor(group_enum)))
         except Exception as ex:
-            results.append("Error adding '{}': {}".format(param['name'], str(ex)))
+            results.append(u"Error adding '{}': {}".format(param['name'], str(ex)))
     t.Commit()
 
-    # Show results
     forms.alert('\n'.join(results), title="Results")
 
 if __name__ == "__main__":
