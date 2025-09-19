@@ -150,7 +150,7 @@ def main():
                 set_param_value(space, param_name, results[key])
             updated_spaces += 1
         t.Commit()
-    output.print_md(f"**Updated {updated_spaces} spaces with HVAC calculations.**")
+    output.print_md("**Updated {} spaces with HVAC calculations.**".format(updated_spaces))
 
 if __name__ == "__main__":
     main()
