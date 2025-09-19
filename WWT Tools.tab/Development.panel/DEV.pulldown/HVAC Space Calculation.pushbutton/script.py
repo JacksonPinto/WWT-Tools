@@ -97,8 +97,6 @@ def get_space_type_defaults(space_type):
     return ASHRAE_DEFAULTS['Default']
 
 def calculate_hvac(space, defaults, area, volume):
-    # Use area and volume in m² and m³
-    # If height is needed, calculate as height = volume / area (if area > 0)
     height = volume / area if (area > 0 and volume > 0) else 0
 
     num_people = area * (defaults['occupant_density'] / 100.0)
@@ -120,7 +118,7 @@ def calculate_hvac(space, defaults, area, volume):
         'Design Cooling Load': design_cooling_load,                       # kW
         'Design ACH': design_ach,
         'Number of People': num_people,
-        'Space Height': height                                            # For debug/reference, not set in Revit
+        'Space Height': height                                            # Internal for debug
     }
 
 PARAM_MAP = {
@@ -133,7 +131,6 @@ PARAM_MAP = {
     'Design Cooling Load': "Design Cooling Load",
     'Design ACH': "Design ACH",
     'Number of People': "Number of People"
-    # 'Space Height': -- Not a Revit parameter, internal only
 }
 
 def main():
@@ -141,32 +138,41 @@ def main():
     output = script.get_output()
     spaces = FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_MEPSpaces).WhereElementIsNotElementType().ToElements()
     updated_spaces = 0
+    debug_lines = []
     with Transaction(doc, "HVAC Calculation for Spaces") as t:
         t.Start()
         for space in spaces:
             space_type = get_param_value(space, BuiltInParameter.ROOM_DEPARTMENT)
             defaults = get_space_type_defaults(space_type)
-
-            # Use BuiltInParameter for Area, Volume, Perimeter
             area = get_param_value(space, BuiltInParameter.ROOM_AREA) or 0
             volume = get_param_value(space, BuiltInParameter.ROOM_VOLUME) or 0
             perimeter = get_param_value(space, BuiltInParameter.ROOM_PERIMETER) or 0
 
-            # Convert from Revit internal units to meters (if needed)
             try:
                 area = DB.UnitUtils.ConvertFromInternalUnits(area, UnitTypeId.SquareMeters)
                 volume = DB.UnitUtils.ConvertFromInternalUnits(volume, UnitTypeId.CubicMeters)
                 perimeter = DB.UnitUtils.ConvertFromInternalUnits(perimeter, UnitTypeId.Meters)
             except Exception:
-                # For IronPython/older API, fallback: values are in project units
                 pass
 
             results = calculate_hvac(space, defaults, area, volume)
             for key, param_name in PARAM_MAP.items():
                 set_param_value(space, param_name, results[key])
             updated_spaces += 1
+
+            # Get space name for debug, fallback to ID if no name
+            space_name = get_param_value_by_name(space, "Name")
+            if not space_name:
+                space_name = "SpaceId: {}".format(space.Id.IntegerValue)
+            # Collect parameter values for debug
+            debug_lines.append('\n{}:'.format(space_name))
+            for key, param_name in PARAM_MAP.items():
+                value = results[key]
+                debug_lines.append('    "{}" = {}'.format(param_name, round(value, 5) if isinstance(value, float) else value))
         t.Commit()
+
     output.print_md("**Updated {} spaces with HVAC calculations.**".format(updated_spaces))
+    output.print_md("---\n**DEBUG VALUES:**\n" + "\n".join(debug_lines))
 
 if __name__ == "__main__":
     main()
