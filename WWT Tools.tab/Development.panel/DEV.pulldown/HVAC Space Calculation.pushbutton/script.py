@@ -4,7 +4,7 @@
 
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction,
-    StorageType, UnitTypeId, ElementId
+    StorageType, UnitTypeId, ElementId, UnitUtils
 )
 from Autodesk.Revit.DB.Mechanical import Space
 from pyrevit import revit, DB, script
@@ -40,6 +40,19 @@ ASHRAE_DEFAULTS = {
     }
 }
 
+# Map parameter names to UnitTypeId for conversion
+PARAM_UNIT_MAP = {
+    "Specified Supply Airflow": UnitTypeId.HVAC_Airflow,            # L/s (internal: CFM)
+    "Specified Return Airflow": UnitTypeId.HVAC_Airflow,
+    "Specified Exhaust Airflow": UnitTypeId.HVAC_Airflow,
+    "ASHRAE Occupant Count Input": UnitTypeId.Number,               # Unitless
+    "ASHRAE Zone Air Distribution Eff": UnitTypeId.Number,          # Unitless
+    "Design Heating Load": UnitTypeId.HVAC_Power,                   # kW (internal: W or BTU/h)
+    "Design Cooling Load": UnitTypeId.HVAC_Power,                   # kW (internal: W or BTU/h)
+    "Design ACH": UnitTypeId.Number,                                # Unitless
+    "Number of People": UnitTypeId.Number                           # Unitless
+}
+
 def get_param_value(element, built_in_param):
     param = element.get_Parameter(built_in_param)
     if param:
@@ -72,21 +85,25 @@ def get_param_value_by_name(element, param_name):
             return param.AsElementId()
     return None
 
-def set_param_value(element, param_name, value):
+def get_param_display_value(element, param_name):
+    param = element.LookupParameter(param_name)
+    if param:
+        try:
+            return param.AsValueString()
+        except Exception:
+            return None
+    return None
+
+def set_param_value_with_unit(element, param_name, display_value):
+    """Set parameter using correct internal value based on display unit."""
     param = element.LookupParameter(param_name)
     if param and not param.IsReadOnly:
         try:
-            if param.StorageType == StorageType.Double:
-                param.Set(float(value))
-            elif param.StorageType == StorageType.Integer:
-                param.Set(int(round(value)))
-            elif param.StorageType == StorageType.String:
-                param.Set(str(value))
-            elif param.StorageType == StorageType.ElementId:
-                if isinstance(value, ElementId):
-                    param.Set(value)
-        except Exception:
-            pass
+            unit_type = PARAM_UNIT_MAP.get(param_name, UnitTypeId.Number)
+            internal_value = DB.UnitUtils.ConvertToInternalUnits(float(display_value), unit_type)
+            param.Set(internal_value)
+        except Exception as e:
+            print("Error setting parameter {}: {}".format(param_name, e))
 
 def get_space_type_defaults(space_type):
     if not space_type:
@@ -98,7 +115,6 @@ def get_space_type_defaults(space_type):
 
 def calculate_hvac(space, defaults, area, volume):
     height = volume / area if (area > 0 and volume > 0) else 0
-
     num_people = area * (defaults['occupant_density'] / 100.0)
     outdoor_airflow = (num_people * defaults['airflow_per_person'] +
                        area * defaults['airflow_per_area'])
@@ -156,8 +172,9 @@ def main():
                 pass
 
             results = calculate_hvac(space, defaults, area, volume)
+            # Set all mapped parameters using correct unit conversion
             for key, param_name in PARAM_MAP.items():
-                set_param_value(space, param_name, results[key])
+                set_param_value_with_unit(space, param_name, results[key])
             updated_spaces += 1
 
             # Get space name for debug, fallback to ID if no name
@@ -167,8 +184,8 @@ def main():
             # Collect parameter values for debug
             debug_lines.append('\n{}:'.format(space_name))
             for key, param_name in PARAM_MAP.items():
-                value = results[key]
-                debug_lines.append('    "{}" = {}'.format(param_name, round(value, 5) if isinstance(value, float) else value))
+                display_val = get_param_display_value(space, param_name)
+                debug_lines.append('    "{}" = {}'.format(param_name, display_val))
         t.Commit()
 
     output.print_md("**Updated {} spaces with HVAC calculations.**".format(updated_spaces))
