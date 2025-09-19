@@ -1,15 +1,16 @@
+# -*- coding: utf-8 -*-
 # pyRevit Script: HVAC System Calculation for Spaces (Revit 2025+ API, CPython)
 # Author: JacksonPinto / Copilot
 # Reference: ASHRAE Design Guides, pyRevit, Revit 2025+ API
 
-from Autodesk.Revit.DB import FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction, StorageType
-from Autodesk.Revit.DB import UnitTypeId
-from Autodesk.Revit.DB import Parameter
+from Autodesk.Revit.DB import (
+    FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction,
+    StorageType, UnitTypeId, ElementId
+)
 from Autodesk.Revit.DB.Mechanical import Space
-from Autodesk.Revit.DB import ElementId
 from pyrevit import revit, DB, script
 
-# ASHRAE default values by Space Type (example, customize as needed)
+# ASHRAE default values by Space Type (customize for your project)
 ASHRAE_DEFAULTS = {
     'Office': {
         'airflow_per_person': 2.5,   # L/s/person
@@ -45,10 +46,9 @@ def get_param_value(element, built_in_param):
     param = element.get_Parameter(built_in_param)
     if param:
         if param.StorageType == StorageType.Double:
-            # Convert Revit internal units to display units, if needed
             try:
                 return param.AsDouble()
-            except:
+            except Exception:
                 return None
         elif param.StorageType == StorageType.String:
             return param.AsString()
@@ -61,16 +61,18 @@ def get_param_value(element, built_in_param):
 def set_param_value(element, param_name, value):
     param = element.LookupParameter(param_name)
     if param and not param.IsReadOnly:
-        if param.StorageType == StorageType.Double:
-            param.Set(float(value))
-        elif param.StorageType == StorageType.Integer:
-            param.Set(int(value))
-        elif param.StorageType == StorageType.String:
-            param.Set(str(value))
-        elif param.StorageType == StorageType.ElementId:
-            if isinstance(value, ElementId):
-                param.Set(value)
-    # If parameter not found or readonly, do nothing
+        try:
+            if param.StorageType == StorageType.Double:
+                param.Set(float(value))
+            elif param.StorageType == StorageType.Integer:
+                param.Set(int(round(value)))
+            elif param.StorageType == StorageType.String:
+                param.Set(str(value))
+            elif param.StorageType == StorageType.ElementId:
+                if isinstance(value, ElementId):
+                    param.Set(value)
+        except Exception as e:
+            pass
 
 def get_space_type_defaults(space_type):
     if not space_type:
@@ -86,7 +88,7 @@ def calculate_hvac(space, defaults, area, volume):
     # Outdoor airflow required (L/s): per ASHRAE (people + area)
     outdoor_airflow = (num_people * defaults['airflow_per_person'] +
                        area * defaults['airflow_per_area'])
-    # Design ACH: outdoor_airflow [L/s] * 3600 / volume [m³]
+    # Design ACH: outdoor_airflow [L/s] * 3.6 / volume [m³]
     design_ach = 0
     if volume > 0:
         design_ach = (outdoor_airflow * 3.6) / volume
@@ -94,20 +96,18 @@ def calculate_hvac(space, defaults, area, volume):
     design_heating_load = area * defaults['sensible_heat'] / 1000.0  # kW
     design_cooling_load = area * (defaults['sensible_heat'] + defaults['latent_heat']) / 1000.0 # kW
 
-    # Return all calculated values
     return {
-        'Specified Supply Airflow': outdoor_airflow,  # L/s
-        'Specified Return Airflow': outdoor_airflow * 0.8,  # Example: 80% of supply
-        'Specified Exhaust Airflow': outdoor_airflow * 0.2,  # Example: 20% of supply
+        'Specified Supply Airflow': outdoor_airflow,                      # L/s
+        'Specified Return Airflow': outdoor_airflow * 0.8,                # Example: 80% of supply
+        'Specified Exhaust Airflow': outdoor_airflow * 0.2,               # Example: 20% of supply
         'ASHRAE Occupant Count Input': num_people,
         'ASHRAE Zone Air Distribution Eff': defaults['zone_efficiency'],
-        'Design Heating Load': design_heating_load,
-        'Design Cooling Load': design_cooling_load,
+        'Design Heating Load': design_heating_load,                       # kW
+        'Design Cooling Load': design_cooling_load,                       # kW
         'Design ACH': design_ach,
         'Number of People': num_people
     }
 
-# Map script calculation keys to Revit parameter names (as in images 1/2)
 PARAM_MAP = {
     'Specified Supply Airflow': "Specified Supply Airflow",
     'Specified Return Airflow': "Specified Return Airflow",
@@ -128,25 +128,24 @@ def main():
     with Transaction(doc, "HVAC Calculation for Spaces") as t:
         t.Start()
         for space in spaces:
-            # Get space type
-            space_type = get_param_value(space, BuiltInParameter.ROOM_DEPARTMENT)  # "Space Type" param
+            # Get space type (BuiltInParameter.ROOM_DEPARTMENT is typically used for Space Type)
+            space_type = get_param_value(space, BuiltInParameter.ROOM_DEPARTMENT)
             defaults = get_space_type_defaults(space_type)
 
-            # Get dimensions (from image 3)
+            # Get dimensions (Area, Perimeter, Height, Volume)
             area = get_param_value(space, BuiltInParameter.ROOM_AREA) or 0
             volume = get_param_value(space, BuiltInParameter.ROOM_VOLUME) or 0
             perimeter = get_param_value(space, BuiltInParameter.ROOM_PERIMETER) or 0
             height = get_param_value(space, BuiltInParameter.ROOM_UNBOUNDED_HEIGHT) or 0
 
-            # Convert from Revit internal units to meters if needed
+            # Convert from Revit internal units to meters (if needed)
             area = DB.UnitUtils.ConvertFromInternalUnits(area, UnitTypeId.SquareMeters)
             volume = DB.UnitUtils.ConvertFromInternalUnits(volume, UnitTypeId.CubicMeters)
             perimeter = DB.UnitUtils.ConvertFromInternalUnits(perimeter, UnitTypeId.Meters)
             height = DB.UnitUtils.ConvertFromInternalUnits(height, UnitTypeId.Meters)
 
-            # Calculate HVAC values
+            # Calculate all HVAC values
             results = calculate_hvac(space, defaults, area, volume)
-            # Set parameters
             for key, param_name in PARAM_MAP.items():
                 set_param_value(space, param_name, results[key])
             updated_spaces += 1
