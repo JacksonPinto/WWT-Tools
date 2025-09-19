@@ -1,0 +1,4 @@
+name: HVAC Space Calculation
+tooltip: This script is designed for Revit 2025+ (CPython, not IronPython) and automates HVAC space calculations according to ASHRAE standards. It scans all Spaces in the project, collects their dimensions, and fills in key HVAC calculation parameters.
+author: Jackson Pinto
+version: 0.0.1
