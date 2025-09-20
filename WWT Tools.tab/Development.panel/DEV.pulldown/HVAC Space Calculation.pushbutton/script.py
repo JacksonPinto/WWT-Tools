@@ -1,12 +1,20 @@
 # -*- coding: utf-8 -*-
-# Revit 2026+ (CPython, modern Units API)
+import sys
+
+# --- ENGINE DETECTION ---
+is_cpython = sys.version_info.major >= 3
+if is_cpython:
+    from Autodesk.Revit.DB import UnitTypeId, UnitUtils
+else:
+    from Autodesk.Revit.DB import DisplayUnitType, UnitUtils
+
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction,
-    StorageType, UnitTypeId, ElementId, UnitUtils
+    StorageType, ElementId
 )
 from pyrevit import revit, DB, script
 
-# ASHRAE defaults by Space Type
+# --- ASHRAE DEFAULTS ---
 ASHRAE_DEFAULTS = {
     'Office': {
         'airflow_per_person': 2.5,   # L/s/person
@@ -37,19 +45,36 @@ ASHRAE_DEFAULTS = {
     }
 }
 
-# Map parameter names to UnitTypeId for conversion (Revit 2021+)
-PARAM_UNIT_MAP = {
-    "Specified Supply Airflow": UnitTypeId.HVAC_Airflow,            # L/s (internal: CFM)
-    "Specified Return Airflow": UnitTypeId.HVAC_Airflow,
-    "Specified Exhaust Airflow": UnitTypeId.HVAC_Airflow,
-    "ASHRAE Occupant Count Input": UnitTypeId.Number,               # Unitless
-    "ASHRAE Zone Air Distribution Eff": UnitTypeId.Number,          # Unitless
-    "Design Heating Load": UnitTypeId.HVAC_Power,                   # kW (internal: W)
-    "Design Cooling Load": UnitTypeId.HVAC_Power,                   # kW (internal: W)
-    "Design ACH": UnitTypeId.Number,                                # Unitless
-    "Number of People": UnitTypeId.Number                           # Unitless
-}
+# --- UNIT MAPS ---
+if is_cpython:
+    PARAM_UNIT_MAP = {
+        "Specified Supply Airflow": UnitTypeId.HVAC_Airflow,            # L/s (internal: CFM)
+        "Specified Return Airflow": UnitTypeId.HVAC_Airflow,
+        "Specified Exhaust Airflow": UnitTypeId.HVAC_Airflow,
+        "ASHRAE Occupant Count Input": UnitTypeId.Number,               # Unitless
+        "ASHRAE Zone Air Distribution Eff": UnitTypeId.Number,          # Unitless
+        "Design Heating Load": UnitTypeId.HVAC_Power,                   # kW (internal: W)
+        "Design Cooling Load": UnitTypeId.HVAC_Power,                   # kW (internal: W)
+        "Design ACH": UnitTypeId.Number,                                # Unitless
+        "Number of People": UnitTypeId.Number                           # Unitless
+    }
+else:
+    PARAM_UNIT_MAP = {
+        "Specified Supply Airflow": DisplayUnitType.DUT_LITERS_PER_SECOND,
+        "Specified Return Airflow": DisplayUnitType.DUT_LITERS_PER_SECOND,
+        "Specified Exhaust Airflow": DisplayUnitType.DUT_LITERS_PER_SECOND,
+        "ASHRAE Occupant Count Input": DisplayUnitType.DUT_GENERAL,
+        "ASHRAE Zone Air Distribution Eff": DisplayUnitType.DUT_GENERAL,
+        "Design Heating Load": DisplayUnitType.DUT_KILOWATTS,
+        "Design Cooling Load": DisplayUnitType.DUT_KILOWATTS,
+        "Design ACH": DisplayUnitType.DUT_GENERAL,
+        "Number of People": DisplayUnitType.DUT_GENERAL
+    }
 
+def to_internal(value, unit_type):
+    return UnitUtils.ConvertToInternalUnits(float(value), unit_type)
+
+# --- PARAMETER ACCESS HELPERS ---
 def get_param_value(element, built_in_param):
     param = element.get_Parameter(built_in_param)
     if param:
@@ -95,8 +120,8 @@ def set_param_value_with_unit(element, param_name, display_value):
     param = element.LookupParameter(param_name)
     if param and not param.IsReadOnly:
         try:
-            unit_type = PARAM_UNIT_MAP.get(param_name, UnitTypeId.Number)
-            internal_value = UnitUtils.ConvertToInternalUnits(float(display_value), unit_type)
+            unit_type = PARAM_UNIT_MAP.get(param_name, PARAM_UNIT_MAP.values()[0])
+            internal_value = to_internal(display_value, unit_type)
             param.Set(internal_value)
         except Exception as e:
             print("Error setting parameter {}: {}".format(param_name, e))
@@ -162,9 +187,14 @@ def main():
 
             # Convert from Revit internal units to meters (if needed)
             try:
-                area = UnitUtils.ConvertFromInternalUnits(area, UnitTypeId.SquareMeters)
-                volume = UnitUtils.ConvertFromInternalUnits(volume, UnitTypeId.CubicMeters)
-                perimeter = UnitUtils.ConvertFromInternalUnits(perimeter, UnitTypeId.Meters)
+                if is_cpython:
+                    area = UnitUtils.ConvertFromInternalUnits(area, UnitTypeId.SquareMeters)
+                    volume = UnitUtils.ConvertFromInternalUnits(volume, UnitTypeId.CubicMeters)
+                    perimeter = UnitUtils.ConvertFromInternalUnits(perimeter, UnitTypeId.Meters)
+                else:
+                    area = UnitUtils.ConvertFromInternalUnits(area, DisplayUnitType.DUT_SQUARE_METERS)
+                    volume = UnitUtils.ConvertFromInternalUnits(volume, DisplayUnitType.DUT_CUBIC_METERS)
+                    perimeter = UnitUtils.ConvertFromInternalUnits(perimeter, DisplayUnitType.DUT_METERS)
             except Exception:
                 pass
 
