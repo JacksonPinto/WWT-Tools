@@ -1,11 +1,29 @@
 # -*- coding: utf-8 -*-
+# Compatible with IronPython (pyRevit default engine, Revit 2019-2024)
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction,
-    StorageType, ElementId, SpecTypeId, UnitUtils
+    StorageType, UnitUtils
 )
 from pyrevit import revit, DB, script
 
-# --- ASHRAE DEFAULTS ---
+# Legacy DisplayUnitType fallback for maximum compatibility
+try:
+    from Autodesk.Revit.DB import DisplayUnitType
+    LITERS_PER_SECOND = DisplayUnitType.DUT_LITERS_PER_SECOND
+    KILOWATTS = DisplayUnitType.DUT_KILOWATTS
+    SQUARE_METERS = DisplayUnitType.DUT_SQUARE_METERS
+    CUBIC_METERS = DisplayUnitType.DUT_CUBIC_METERS
+    METERS = DisplayUnitType.DUT_METERS
+    GENERAL = DisplayUnitType.DUT_GENERAL
+except ImportError:
+    # Hardcoded integer values for Revit 2022+ if DisplayUnitType is missing
+    LITERS_PER_SECOND = 23
+    KILOWATTS = 31
+    SQUARE_METERS = 6
+    CUBIC_METERS = 24
+    METERS = 2
+    GENERAL = 0
+
 ASHRAE_DEFAULTS = {
     'Office': {
         'airflow_per_person': 2.5,   # L/s/person
@@ -36,17 +54,16 @@ ASHRAE_DEFAULTS = {
     }
 }
 
-# --- PARAMETER UNIT MAP USING SpecTypeId ---
 PARAM_UNIT_MAP = {
-    "Specified Supply Airflow": SpecTypeId.AirFlow,         # L/s (internal: m³/s)
-    "Specified Return Airflow": SpecTypeId.AirFlow,
-    "Specified Exhaust Airflow": SpecTypeId.AirFlow,
-    "ASHRAE Occupant Count Input": SpecTypeId.Number,       # Unitless
-    "ASHRAE Zone Air Distribution Eff": SpecTypeId.Number,  # Unitless
-    "Design Heating Load": SpecTypeId.HVACPower,            # kW (internal: W)
-    "Design Cooling Load": SpecTypeId.HVACPower,
-    "Design ACH": SpecTypeId.Number,                        # Unitless
-    "Number of People": SpecTypeId.Number                   # Unitless
+    "Specified Supply Airflow": LITERS_PER_SECOND,
+    "Specified Return Airflow": LITERS_PER_SECOND,
+    "Specified Exhaust Airflow": LITERS_PER_SECOND,
+    "ASHRAE Occupant Count Input": GENERAL,
+    "ASHRAE Zone Air Distribution Eff": GENERAL,
+    "Design Heating Load": KILOWATTS,
+    "Design Cooling Load": KILOWATTS,
+    "Design ACH": GENERAL,
+    "Number of People": GENERAL
 }
 
 def get_param_value(element, built_in_param):
@@ -94,11 +111,11 @@ def set_param_value_with_unit(element, param_name, display_value):
     param = element.LookupParameter(param_name)
     if param and not param.IsReadOnly:
         try:
-            unit_type = PARAM_UNIT_MAP.get(param_name, SpecTypeId.Number)
+            unit_type = PARAM_UNIT_MAP.get(param_name, GENERAL)
             internal_value = UnitUtils.ConvertToInternalUnits(float(display_value), unit_type)
             param.Set(internal_value)
         except Exception as e:
-            print(f"Error setting parameter {param_name}: {e}")
+            print("Error setting parameter {}: {}".format(param_name, e))
 
 def get_space_type_defaults(space_type):
     if not space_type:
@@ -147,45 +164,47 @@ PARAM_MAP = {
 def main():
     doc = revit.doc
     output = script.get_output()
-    spaces = FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_MEPSpaces).WhereElementIsNotElementType().ToElements()
+    spaces = FilteredElementCollector(doc)\
+        .OfCategory(BuiltInCategory.OST_MEPSpaces)\
+        .WhereElementIsNotElementType().ToElements()
     updated_spaces = 0
     debug_lines = []
-    with Transaction(doc, "HVAC Calculation for Spaces") as t:
-        t.Start()
-        for space in spaces:
-            space_type = get_param_value(space, BuiltInParameter.ROOM_DEPARTMENT)
-            defaults = get_space_type_defaults(space_type)
-            area = get_param_value(space, BuiltInParameter.ROOM_AREA) or 0
-            volume = get_param_value(space, BuiltInParameter.ROOM_VOLUME) or 0
-            perimeter = get_param_value(space, BuiltInParameter.ROOM_PERIMETER) or 0
+    t = Transaction(doc, "HVAC Calculation for Spaces")
+    t.Start()
+    for space in spaces:
+        space_type = get_param_value(space, BuiltInParameter.ROOM_DEPARTMENT)
+        defaults = get_space_type_defaults(space_type)
+        area = get_param_value(space, BuiltInParameter.ROOM_AREA) or 0
+        volume = get_param_value(space, BuiltInParameter.ROOM_VOLUME) or 0
+        perimeter = get_param_value(space, BuiltInParameter.ROOM_PERIMETER) or 0
 
-            # Convert from Revit internal units to meters (if needed)
-            try:
-                area = UnitUtils.ConvertFromInternalUnits(area, SpecTypeId.Area)
-                volume = UnitUtils.ConvertFromInternalUnits(volume, SpecTypeId.Volume)
-                perimeter = UnitUtils.ConvertFromInternalUnits(perimeter, SpecTypeId.Length)
-            except Exception:
-                pass
+        # Convert from Revit internal units to meters (if needed)
+        try:
+            area = UnitUtils.ConvertFromInternalUnits(area, SQUARE_METERS)
+            volume = UnitUtils.ConvertFromInternalUnits(volume, CUBIC_METERS)
+            perimeter = UnitUtils.ConvertFromInternalUnits(perimeter, METERS)
+        except Exception:
+            pass
 
-            results = calculate_hvac(space, defaults, area, volume)
-            # Set all mapped parameters using correct unit conversion
-            for key, param_name in PARAM_MAP.items():
-                set_param_value_with_unit(space, param_name, results[key])
-            updated_spaces += 1
+        results = calculate_hvac(space, defaults, area, volume)
+        # Set all mapped parameters using correct unit conversion
+        for key, param_name in PARAM_MAP.items():
+            set_param_value_with_unit(space, param_name, results[key])
+        updated_spaces += 1
 
-            # Get space name for debug, fallback to ID if no name
-            space_name = get_param_value_by_name(space, "Name")
-            if not space_name:
-                space_name = f"SpaceId: {space.Id.IntegerValue}"
-            # Collect parameter values for debug
-            debug_lines.append(f'\n{space_name}:')
-            for key, param_name in PARAM_MAP.items():
-                display_val = get_param_display_value(space, param_name)
-                debug_lines.append(f'    "{param_name}" = {display_val}')
-        t.Commit()
+        # Get space name for debug, fallback to ID if no name
+        space_name = get_param_value_by_name(space, "Name")
+        if not space_name:
+            space_name = "SpaceId: {}".format(space.Id.IntegerValue)
+        # Collect parameter values for debug
+        debug_lines.append('\n{}:'.format(space_name))
+        for key, param_name in PARAM_MAP.items():
+            display_val = get_param_display_value(space, param_name)
+            debug_lines.append('    "{}" = {}'.format(param_name, display_val))
+    t.Commit()
 
-    output.print_md(f"**Updated {updated_spaces} spaces with HVAC calculations.**")
-    output.print_md("---\n**DEBUG VALUES:**\n" + "\n".join(debug_lines))
+    output.print_md("**Updated {} spaces with HVAC calculations.**".format(updated_spaces))
+    output.print_md("---\n**DEBUG VALUES:**\n{}".format("\n".join(debug_lines)))
 
 if __name__ == "__main__":
     main()
