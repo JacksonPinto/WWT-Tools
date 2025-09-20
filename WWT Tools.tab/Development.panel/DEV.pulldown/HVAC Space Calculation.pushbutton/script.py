@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction,
-    StorageType, ElementId, UnitTypeId, UnitUtils
+    StorageType, ElementId, SpecTypeId, UnitUtils
 )
 from pyrevit import revit, DB, script
 
+# --- ASHRAE DEFAULTS ---
 ASHRAE_DEFAULTS = {
     'Office': {
         'airflow_per_person': 2.5,   # L/s/person
@@ -36,16 +37,17 @@ ASHRAE_DEFAULTS = {
     }
 }
 
+# --- PARAMETER UNIT MAP USING SpecTypeId ---
 PARAM_UNIT_MAP = {
-    "Specified Supply Airflow": UnitTypeId.HVAC_Airflow,
-    "Specified Return Airflow": UnitTypeId.HVAC_Airflow,
-    "Specified Exhaust Airflow": UnitTypeId.HVAC_Airflow,
-    "ASHRAE Occupant Count Input": UnitTypeId.Number,
-    "ASHRAE Zone Air Distribution Eff": UnitTypeId.Number,
-    "Design Heating Load": UnitTypeId.HVAC_Power,
-    "Design Cooling Load": UnitTypeId.HVAC_Power,
-    "Design ACH": UnitTypeId.Number,
-    "Number of People": UnitTypeId.Number
+    "Specified Supply Airflow": SpecTypeId.AirFlow,         # L/s (internal: m³/s)
+    "Specified Return Airflow": SpecTypeId.AirFlow,
+    "Specified Exhaust Airflow": SpecTypeId.AirFlow,
+    "ASHRAE Occupant Count Input": SpecTypeId.Number,       # Unitless
+    "ASHRAE Zone Air Distribution Eff": SpecTypeId.Number,  # Unitless
+    "Design Heating Load": SpecTypeId.HVACPower,            # kW (internal: W)
+    "Design Cooling Load": SpecTypeId.HVACPower,
+    "Design ACH": SpecTypeId.Number,                        # Unitless
+    "Number of People": SpecTypeId.Number                   # Unitless
 }
 
 def get_param_value(element, built_in_param):
@@ -93,7 +95,7 @@ def set_param_value_with_unit(element, param_name, display_value):
     param = element.LookupParameter(param_name)
     if param and not param.IsReadOnly:
         try:
-            unit_type = PARAM_UNIT_MAP.get(param_name, UnitTypeId.Number)
+            unit_type = PARAM_UNIT_MAP.get(param_name, SpecTypeId.Number)
             internal_value = UnitUtils.ConvertToInternalUnits(float(display_value), unit_type)
             param.Set(internal_value)
         except Exception as e:
@@ -160,9 +162,9 @@ def main():
 
             # Convert from Revit internal units to meters (if needed)
             try:
-                area = UnitUtils.ConvertFromInternalUnits(area, UnitTypeId.SquareMeters)
-                volume = UnitUtils.ConvertFromInternalUnits(volume, UnitTypeId.CubicMeters)
-                perimeter = UnitUtils.ConvertFromInternalUnits(perimeter, UnitTypeId.Meters)
+                area = UnitUtils.ConvertFromInternalUnits(area, SpecTypeId.Area)
+                volume = UnitUtils.ConvertFromInternalUnits(volume, SpecTypeId.Volume)
+                perimeter = UnitUtils.ConvertFromInternalUnits(perimeter, SpecTypeId.Length)
             except Exception:
                 pass
 
