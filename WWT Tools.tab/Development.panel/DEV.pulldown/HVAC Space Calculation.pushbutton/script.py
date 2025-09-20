@@ -1,20 +1,11 @@
+#! python3
 # -*- coding: utf-8 -*-
-import sys
-
-# --- ENGINE DETECTION ---
-is_cpython = sys.version_info.major >= 3
-if is_cpython:
-    from Autodesk.Revit.DB import UnitTypeId, UnitUtils
-else:
-    from Autodesk.Revit.DB import DisplayUnitType, UnitUtils
-
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction,
-    StorageType, ElementId
+    StorageType, ElementId, UnitTypeId, UnitUtils
 )
 from pyrevit import revit, DB, script
 
-# --- ASHRAE DEFAULTS ---
 ASHRAE_DEFAULTS = {
     'Office': {
         'airflow_per_person': 2.5,   # L/s/person
@@ -45,36 +36,18 @@ ASHRAE_DEFAULTS = {
     }
 }
 
-# --- UNIT MAPS ---
-if is_cpython:
-    PARAM_UNIT_MAP = {
-        "Specified Supply Airflow": UnitTypeId.HVAC_Airflow,            # L/s (internal: CFM)
-        "Specified Return Airflow": UnitTypeId.HVAC_Airflow,
-        "Specified Exhaust Airflow": UnitTypeId.HVAC_Airflow,
-        "ASHRAE Occupant Count Input": UnitTypeId.Number,               # Unitless
-        "ASHRAE Zone Air Distribution Eff": UnitTypeId.Number,          # Unitless
-        "Design Heating Load": UnitTypeId.HVAC_Power,                   # kW (internal: W)
-        "Design Cooling Load": UnitTypeId.HVAC_Power,                   # kW (internal: W)
-        "Design ACH": UnitTypeId.Number,                                # Unitless
-        "Number of People": UnitTypeId.Number                           # Unitless
-    }
-else:
-    PARAM_UNIT_MAP = {
-        "Specified Supply Airflow": DisplayUnitType.DUT_LITERS_PER_SECOND,
-        "Specified Return Airflow": DisplayUnitType.DUT_LITERS_PER_SECOND,
-        "Specified Exhaust Airflow": DisplayUnitType.DUT_LITERS_PER_SECOND,
-        "ASHRAE Occupant Count Input": DisplayUnitType.DUT_GENERAL,
-        "ASHRAE Zone Air Distribution Eff": DisplayUnitType.DUT_GENERAL,
-        "Design Heating Load": DisplayUnitType.DUT_KILOWATTS,
-        "Design Cooling Load": DisplayUnitType.DUT_KILOWATTS,
-        "Design ACH": DisplayUnitType.DUT_GENERAL,
-        "Number of People": DisplayUnitType.DUT_GENERAL
-    }
+PARAM_UNIT_MAP = {
+    "Specified Supply Airflow": UnitTypeId.HVAC_Airflow,
+    "Specified Return Airflow": UnitTypeId.HVAC_Airflow,
+    "Specified Exhaust Airflow": UnitTypeId.HVAC_Airflow,
+    "ASHRAE Occupant Count Input": UnitTypeId.Number,
+    "ASHRAE Zone Air Distribution Eff": UnitTypeId.Number,
+    "Design Heating Load": UnitTypeId.HVAC_Power,
+    "Design Cooling Load": UnitTypeId.HVAC_Power,
+    "Design ACH": UnitTypeId.Number,
+    "Number of People": UnitTypeId.Number
+}
 
-def to_internal(value, unit_type):
-    return UnitUtils.ConvertToInternalUnits(float(value), unit_type)
-
-# --- PARAMETER ACCESS HELPERS ---
 def get_param_value(element, built_in_param):
     param = element.get_Parameter(built_in_param)
     if param:
@@ -120,17 +93,17 @@ def set_param_value_with_unit(element, param_name, display_value):
     param = element.LookupParameter(param_name)
     if param and not param.IsReadOnly:
         try:
-            unit_type = PARAM_UNIT_MAP.get(param_name, PARAM_UNIT_MAP.values()[0])
-            internal_value = to_internal(display_value, unit_type)
+            unit_type = PARAM_UNIT_MAP.get(param_name, UnitTypeId.Number)
+            internal_value = UnitUtils.ConvertToInternalUnits(float(display_value), unit_type)
             param.Set(internal_value)
         except Exception as e:
-            print("Error setting parameter {}: {}".format(param_name, e))
+            print(f"Error setting parameter {param_name}: {e}")
 
 def get_space_type_defaults(space_type):
     if not space_type:
         return ASHRAE_DEFAULTS['Default']
     for k in ASHRAE_DEFAULTS.keys():
-        if k.lower() in space_type.lower():
+        if k.lower() in (space_type or "").lower():
             return ASHRAE_DEFAULTS[k]
     return ASHRAE_DEFAULTS['Default']
 
@@ -187,14 +160,9 @@ def main():
 
             # Convert from Revit internal units to meters (if needed)
             try:
-                if is_cpython:
-                    area = UnitUtils.ConvertFromInternalUnits(area, UnitTypeId.SquareMeters)
-                    volume = UnitUtils.ConvertFromInternalUnits(volume, UnitTypeId.CubicMeters)
-                    perimeter = UnitUtils.ConvertFromInternalUnits(perimeter, UnitTypeId.Meters)
-                else:
-                    area = UnitUtils.ConvertFromInternalUnits(area, DisplayUnitType.DUT_SQUARE_METERS)
-                    volume = UnitUtils.ConvertFromInternalUnits(volume, DisplayUnitType.DUT_CUBIC_METERS)
-                    perimeter = UnitUtils.ConvertFromInternalUnits(perimeter, DisplayUnitType.DUT_METERS)
+                area = UnitUtils.ConvertFromInternalUnits(area, UnitTypeId.SquareMeters)
+                volume = UnitUtils.ConvertFromInternalUnits(volume, UnitTypeId.CubicMeters)
+                perimeter = UnitUtils.ConvertFromInternalUnits(perimeter, UnitTypeId.Meters)
             except Exception:
                 pass
 
@@ -207,15 +175,15 @@ def main():
             # Get space name for debug, fallback to ID if no name
             space_name = get_param_value_by_name(space, "Name")
             if not space_name:
-                space_name = "SpaceId: {}".format(space.Id.IntegerValue)
+                space_name = f"SpaceId: {space.Id.IntegerValue}"
             # Collect parameter values for debug
-            debug_lines.append('\n{}:'.format(space_name))
+            debug_lines.append(f'\n{space_name}:')
             for key, param_name in PARAM_MAP.items():
                 display_val = get_param_display_value(space, param_name)
-                debug_lines.append('    "{}" = {}'.format(param_name, display_val))
+                debug_lines.append(f'    "{param_name}" = {display_val}')
         t.Commit()
 
-    output.print_md("**Updated {} spaces with HVAC calculations.**".format(updated_spaces))
+    output.print_md(f"**Updated {updated_spaces} spaces with HVAC calculations.**")
     output.print_md("---\n**DEBUG VALUES:**\n" + "\n".join(debug_lines))
 
 if __name__ == "__main__":
