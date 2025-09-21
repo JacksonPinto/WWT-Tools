@@ -1,15 +1,8 @@
-# -*- coding: utf-8 -*-
-# Compatible with Revit 2022+ (IronPython or CPython) - Uses SpecTypeId units API
-
+#! python3
 from pyrevit import revit, script
 from Autodesk.Revit.DB import (
-    FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction, StorageType, UnitUtils
+    FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction, StorageType, UnitUtils, SpecTypeId
 )
-
-try:
-    from Autodesk.Revit.DB import SpecTypeId
-except ImportError:
-    raise ImportError("This script requires Revit 2022 or later. SpecTypeId (new units API) is missing.")
 
 ASHRAE_DEFAULTS = {
     'Office': {
