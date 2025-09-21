@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 # IronPython (pyRevit default engine) and Revit legacy API compatible
+
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction,
-    StorageType
+    StorageType, UnitUtils, DisplayUnitType
 )
 from pyrevit import revit, DB, script
 
@@ -36,7 +37,7 @@ ASHRAE_DEFAULTS = {
     }
 }
 
-# Map parameters to display units for appending (do NOT use for UnitUtils)
+# Unit suffixes for display (do NOT use for conversions)
 PARAM_UNIT_SUFFIX = {
     "Specified Supply Airflow": "L/s",
     "Specified Return Airflow": "L/s",
@@ -90,16 +91,20 @@ def get_param_display_value(element, param_name):
             return None
     return None
 
-def set_param_value_with_unit(element, param_name, display_value):
+def set_param_value_as_string_with_unit(element, param_name, display_value):
     param = element.LookupParameter(param_name)
     if param and not param.IsReadOnly:
         try:
-            # Compose value as string with unit suffix if needed
             suffix = PARAM_UNIT_SUFFIX.get(param_name, "")
+            # Always output as string, with or without units
             if suffix:
                 str_value = "{} {}".format(round(display_value, 2), suffix)
             else:
-                str_value = str(int(round(display_value))) if display_value == int(display_value) else str(round(display_value, 2))
+                # Integers show as int, floats as rounded to 2 decimals
+                if display_value == int(display_value):
+                    str_value = str(int(display_value))
+                else:
+                    str_value = str(round(display_value, 2))
             param.Set(str_value)
         except Exception as e:
             print("Error setting parameter {}: {}".format(param_name, e))
@@ -161,18 +166,17 @@ def main():
     for space in spaces:
         space_type = get_param_value(space, BuiltInParameter.ROOM_DEPARTMENT)
         defaults = get_space_type_defaults(space_type)
-        area = get_param_value(space, BuiltInParameter.ROOM_AREA) or 0
-        volume = get_param_value(space, BuiltInParameter.ROOM_VOLUME) or 0
-        perimeter = get_param_value(space, BuiltInParameter.ROOM_PERIMETER) or 0
+        area_raw = get_param_value(space, BuiltInParameter.ROOM_AREA) or 0
+        volume_raw = get_param_value(space, BuiltInParameter.ROOM_VOLUME) or 0
 
-        # Convert from Revit internal units to meters (if needed)
-        # For this script, area/volume are assumed to be in m2/m3
-        # If you want to convert, uncomment and use UnitUtils
+        # Convert Revit internal units to metric (m2, m3)
+        area = UnitUtils.ConvertFromInternalUnits(area_raw, DisplayUnitType.DUT_SQUARE_METERS)
+        volume = UnitUtils.ConvertFromInternalUnits(volume_raw, DisplayUnitType.DUT_CUBIC_METERS)
 
         results = calculate_hvac(space, defaults, area, volume)
         # Set all mapped parameters as strings with unit appended
         for key, param_name in PARAM_MAP.items():
-            set_param_value_with_unit(space, param_name, results[key])
+            set_param_value_as_string_with_unit(space, param_name, results[key])
         updated_spaces += 1
 
         # Get space name for debug, fallback to ID if no name
