@@ -1,29 +1,10 @@
 # -*- coding: utf-8 -*-
 # IronPython (pyRevit default engine) and Revit legacy API compatible
-
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction,
-    StorageType, UnitUtils
+    StorageType
 )
 from pyrevit import revit, DB, script
-
-# --- Legacy DisplayUnitType fallback for maximum compatibility ---
-try:
-    from Autodesk.Revit.DB import DisplayUnitType
-    LITERS_PER_SECOND = DisplayUnitType.DUT_LITERS_PER_SECOND
-    KILOWATTS = DisplayUnitType.DUT_KILOWATTS
-    SQUARE_METERS = DisplayUnitType.DUT_SQUARE_METERS
-    CUBIC_METERS = DisplayUnitType.DUT_CUBIC_METERS
-    METERS = DisplayUnitType.DUT_METERS
-    GENERAL = DisplayUnitType.DUT_GENERAL
-except ImportError:
-    # Hardcoded integer values for Revit 2022+ if DisplayUnitType is missing
-    LITERS_PER_SECOND = 23
-    KILOWATTS = 31
-    SQUARE_METERS = 6
-    CUBIC_METERS = 24
-    METERS = 2
-    GENERAL = 0
 
 ASHRAE_DEFAULTS = {
     'Office': {
@@ -55,16 +36,17 @@ ASHRAE_DEFAULTS = {
     }
 }
 
-PARAM_UNIT_MAP = {
-    "Specified Supply Airflow": LITERS_PER_SECOND,
-    "Specified Return Airflow": LITERS_PER_SECOND,
-    "Specified Exhaust Airflow": LITERS_PER_SECOND,
-    "ASHRAE Occupant Count Input": GENERAL,
-    "ASHRAE Zone Air Distribution Eff": GENERAL,
-    "Design Heating Load": KILOWATTS,
-    "Design Cooling Load": KILOWATTS,
-    "Design ACH": GENERAL,
-    "Number of People": GENERAL
+# Map parameters to display units for appending (do NOT use for UnitUtils)
+PARAM_UNIT_SUFFIX = {
+    "Specified Supply Airflow": "L/s",
+    "Specified Return Airflow": "L/s",
+    "Specified Exhaust Airflow": "L/s",
+    "ASHRAE Occupant Count Input": "",
+    "ASHRAE Zone Air Distribution Eff": "",
+    "Design Heating Load": "kW",
+    "Design Cooling Load": "kW",
+    "Design ACH": "",
+    "Number of People": ""
 }
 
 def get_param_value(element, built_in_param):
@@ -112,16 +94,13 @@ def set_param_value_with_unit(element, param_name, display_value):
     param = element.LookupParameter(param_name)
     if param and not param.IsReadOnly:
         try:
-            unit_type = PARAM_UNIT_MAP.get(param_name, GENERAL)
-            # If param is integer or general, don't convert units
-            if unit_type == GENERAL:
-                try:
-                    param.Set(int(display_value))
-                except Exception:
-                    param.Set(float(display_value))
+            # Compose value as string with unit suffix if needed
+            suffix = PARAM_UNIT_SUFFIX.get(param_name, "")
+            if suffix:
+                str_value = "{} {}".format(round(display_value, 2), suffix)
             else:
-                internal_value = UnitUtils.ConvertToInternalUnits(float(display_value), unit_type)
-                param.Set(internal_value)
+                str_value = str(int(round(display_value))) if display_value == int(display_value) else str(round(display_value, 2))
+            param.Set(str_value)
         except Exception as e:
             print("Error setting parameter {}: {}".format(param_name, e))
 
@@ -187,15 +166,11 @@ def main():
         perimeter = get_param_value(space, BuiltInParameter.ROOM_PERIMETER) or 0
 
         # Convert from Revit internal units to meters (if needed)
-        try:
-            area = UnitUtils.ConvertFromInternalUnits(area, SQUARE_METERS)
-            volume = UnitUtils.ConvertFromInternalUnits(volume, CUBIC_METERS)
-            perimeter = UnitUtils.ConvertFromInternalUnits(perimeter, METERS)
-        except Exception:
-            pass
+        # For this script, area/volume are assumed to be in m2/m3
+        # If you want to convert, uncomment and use UnitUtils
 
         results = calculate_hvac(space, defaults, area, volume)
-        # Set all mapped parameters using correct unit conversion
+        # Set all mapped parameters as strings with unit appended
         for key, param_name in PARAM_MAP.items():
             set_param_value_with_unit(space, param_name, results[key])
         updated_spaces += 1
