@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
-from Autodesk.Revit.DB import (
-    FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction,
-    StorageType, UnitUtils, DisplayUnitType
-)
+# Compatible with Revit 2022+ (IronPython or CPython) - Uses SpecTypeId units API
+
 from pyrevit import revit, script
+from Autodesk.Revit.DB import (
+    FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction, StorageType, UnitUtils
+)
+
+try:
+    from Autodesk.Revit.DB import SpecTypeId
+except ImportError:
+    raise ImportError("This script requires Revit 2022 or later. SpecTypeId (new units API) is missing.")
 
 ASHRAE_DEFAULTS = {
     'Office': {
@@ -36,15 +42,27 @@ ASHRAE_DEFAULTS = {
 }
 
 PARAM_UNIT_MAP = {
-    "Specified Supply Airflow": DisplayUnitType.DUT_LITERS_PER_SECOND,
-    "Specified Return Airflow": DisplayUnitType.DUT_LITERS_PER_SECOND,
-    "Specified Exhaust Airflow": DisplayUnitType.DUT_LITERS_PER_SECOND,
-    "ASHRAE Occupant Count Input": DisplayUnitType.DUT_GENERAL,
-    "ASHRAE Zone Air Distribution Eff": DisplayUnitType.DUT_GENERAL,
-    "Design Heating Load": DisplayUnitType.DUT_KILOWATTS,
-    "Design Cooling Load": DisplayUnitType.DUT_KILOWATTS,
-    "Design ACH": DisplayUnitType.DUT_GENERAL,
-    "Number of People": DisplayUnitType.DUT_GENERAL
+    "Specified Supply Airflow": SpecTypeId.AirFlow,
+    "Specified Return Airflow": SpecTypeId.AirFlow,
+    "Specified Exhaust Airflow": SpecTypeId.AirFlow,
+    "ASHRAE Occupant Count Input": SpecTypeId.Number,
+    "ASHRAE Zone Air Distribution Eff": SpecTypeId.Number,
+    "Design Heating Load": SpecTypeId.HVACPower,
+    "Design Cooling Load": SpecTypeId.HVACPower,
+    "Design ACH": SpecTypeId.Number,
+    "Number of People": SpecTypeId.Number
+}
+
+PARAM_MAP = {
+    'Specified Supply Airflow': "Specified Supply Airflow",
+    'Specified Return Airflow': "Specified Return Airflow",
+    'Specified Exhaust Airflow': "Specified Exhaust Airflow",
+    'ASHRAE Occupant Count Input': "ASHRAE Occupant Count Input",
+    'ASHRAE Zone Air Distribution Eff': "ASHRAE Zone Air Distribution Eff",
+    'Design Heating Load': "Design Heating Load",
+    'Design Cooling Load': "Design Cooling Load",
+    'Design ACH': "Design ACH",
+    'Number of People': "Number of People"
 }
 
 def get_param_value(element, built_in_param):
@@ -92,16 +110,9 @@ def set_param_value_with_unit(element, param_name, display_value):
     param = element.LookupParameter(param_name)
     if param and not param.IsReadOnly:
         try:
-            unit_type = PARAM_UNIT_MAP.get(param_name, DisplayUnitType.DUT_GENERAL)
-            # If param is integer or general, don't convert units
-            if unit_type == DisplayUnitType.DUT_GENERAL:
-                try:
-                    param.Set(int(round(display_value)))
-                except Exception:
-                    param.Set(float(display_value))
-            else:
-                internal_value = UnitUtils.ConvertToInternalUnits(float(display_value), unit_type)
-                param.Set(internal_value)
+            unit_type = PARAM_UNIT_MAP.get(param_name, SpecTypeId.Number)
+            internal_value = UnitUtils.ConvertToInternalUnits(float(display_value), unit_type)
+            param.Set(internal_value)
         except Exception as e:
             print("Error setting parameter {}: {}".format(param_name, e))
 
@@ -137,18 +148,6 @@ def calculate_hvac(space, defaults, area, volume):
         'Space Height': height                                            # Internal for debug
     }
 
-PARAM_MAP = {
-    'Specified Supply Airflow': "Specified Supply Airflow",
-    'Specified Return Airflow': "Specified Return Airflow",
-    'Specified Exhaust Airflow': "Specified Exhaust Airflow",
-    'ASHRAE Occupant Count Input': "ASHRAE Occupant Count Input",
-    'ASHRAE Zone Air Distribution Eff': "ASHRAE Zone Air Distribution Eff",
-    'Design Heating Load': "Design Heating Load",
-    'Design Cooling Load': "Design Cooling Load",
-    'Design ACH': "Design ACH",
-    'Number of People': "Number of People"
-}
-
 def main():
     doc = revit.doc
     output = script.get_output()
@@ -166,20 +165,15 @@ def main():
         volume_raw = get_param_value(space, BuiltInParameter.ROOM_VOLUME) or 0
 
         # Convert Revit internal units to metric (m2, m3)
-        area = UnitUtils.ConvertFromInternalUnits(area_raw, DisplayUnitType.DUT_SQUARE_METERS)
-        volume = UnitUtils.ConvertFromInternalUnits(volume_raw, DisplayUnitType.DUT_CUBIC_METERS)
+        area = UnitUtils.ConvertFromInternalUnits(area_raw, SpecTypeId.Area)
+        volume = UnitUtils.ConvertFromInternalUnits(volume_raw, SpecTypeId.Volume)
 
         results = calculate_hvac(space, defaults, area, volume)
-        # Set all mapped parameters using correct unit conversion
         for key, param_name in PARAM_MAP.items():
             set_param_value_with_unit(space, param_name, results[key])
         updated_spaces += 1
 
-        # Get space name for debug, fallback to ID if no name
-        space_name = get_param_value_by_name(space, "Name")
-        if not space_name:
-            space_name = "SpaceId: {}".format(space.Id.IntegerValue)
-        # Collect parameter values for debug
+        space_name = get_param_value_by_name(space, "Name") or "SpaceId: {}".format(space.Id.IntegerValue)
         debug_lines.append('\n{}:'.format(space_name))
         for key, param_name in PARAM_MAP.items():
             display_val = get_param_display_value(space, param_name)
