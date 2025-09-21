@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-# Compatible with IronPython (pyRevit default engine, Revit 2019-2024)
+# IronPython (pyRevit default engine) and Revit legacy API compatible
+
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, BuiltInParameter, Transaction,
     StorageType, UnitUtils
 )
 from pyrevit import revit, DB, script
 
-# Legacy DisplayUnitType fallback for maximum compatibility
+# --- Legacy DisplayUnitType fallback for maximum compatibility ---
 try:
     from Autodesk.Revit.DB import DisplayUnitType
     LITERS_PER_SECOND = DisplayUnitType.DUT_LITERS_PER_SECOND
@@ -112,8 +113,15 @@ def set_param_value_with_unit(element, param_name, display_value):
     if param and not param.IsReadOnly:
         try:
             unit_type = PARAM_UNIT_MAP.get(param_name, GENERAL)
-            internal_value = UnitUtils.ConvertToInternalUnits(float(display_value), unit_type)
-            param.Set(internal_value)
+            # If param is integer or general, don't convert units
+            if unit_type == GENERAL:
+                try:
+                    param.Set(int(display_value))
+                except Exception:
+                    param.Set(float(display_value))
+            else:
+                internal_value = UnitUtils.ConvertToInternalUnits(float(display_value), unit_type)
+                param.Set(internal_value)
         except Exception as e:
             print("Error setting parameter {}: {}".format(param_name, e))
 
