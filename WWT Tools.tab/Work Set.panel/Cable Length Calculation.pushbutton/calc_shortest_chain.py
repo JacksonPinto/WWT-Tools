@@ -1,6 +1,7 @@
 #! python3
 # calc_shortest_chain.py
-# Daisy-chain shortest path (sequência ordenada pelo usuário) usando TopologicPy
+# Calcula menor caminho para cada par consecutivo de elementos selecionados (A->B, B->C, ..., Z->EndPoint)
+# e gera a saída compatível com update_cable_lengths.py
 
 import os, sys, json, math, time
 from topologicpy.Topology import Topology
@@ -45,13 +46,12 @@ def main():
     starts = data.get("start_points", [])
     end_pt = data.get("end_point", None)
 
-    # Seleção de edges (igual ao main)
     if infra_edges and device_edges:
         edges_source = (infra_edges, device_edges)
     else:
         edges_source = (combined, [])
 
-    log("Vertices:{} InfraEdges:{} DeviceEdges:{} TotalEdges:{} OrderedPoints:{}".format(
+    log("Vertices:{} InfraEdges:{} DeviceEdges:{} TotalEdges:{} ChainPoints:{}".format(
         len(vertices), len(infra_edges), len(device_edges), len(combined), len(starts)
     ))
 
@@ -82,7 +82,7 @@ def main():
     log("Graph vertices: {}".format(len(coords)))
 
     # Mapear pontos ordenados da sequência do usuário
-    ordered_points = []
+    mapped_points = []
     for sp in starts:
         coord = sp.get("point")
         eid = sp.get("element_id")
@@ -90,10 +90,8 @@ def main():
         idx, d = nearest_vertex_index(coord, coords)
         if d > MAP_TOLERANCE:
             log("WARN mapping {} distance {:.6f}".format(eid, d))
-        ordered_points.append((eid, graph_vertices[idx], d))
-    log("Ordered points mapped: {}".format(len(ordered_points)))
+        mapped_points.append({"element_id": eid, "vertex": graph_vertices[idx], "coord": coord, "mapped_distance": d})
 
-    # Mapear end_point
     if not (isinstance(end_pt, list) and len(end_pt) == 3):
         log("ERROR invalid end point"); sys.exit(1)
     end_idx, end_d = nearest_vertex_index(end_pt, coords)
@@ -101,34 +99,48 @@ def main():
         log("WARN end mapping distance {:.6f}".format(end_d))
     end_v = graph_vertices[end_idx]
 
-    # Montar sequência: todos start_points (na ordem), depois end_v
-    chain_vertices = [v for (_, v, _) in ordered_points] + [end_v]
-
-    # Calcular caminho daisy-chain
-    full_path_vertices = []
-    success = True
-    path_lengths = []
-    mapped_distances = [d for (_, _, d) in ordered_points]
-    try:
-        for i in range(len(chain_vertices) - 1):
-            seg_wire = Graph.ShortestPath(graph, chain_vertices[i], chain_vertices[i+1], edgeKey="cost", tolerance=TOLERANCE)
-            if not seg_wire:
-                log("ERROR: No path between chain points {} and {}".format(i, i+1))
-                success = False
-                break
-            wv = Wire.Vertices(seg_wire)
-            seg_coords = [x.Coordinates() for x in wv]
-            if i > 0 and len(seg_coords) > 0:
-                seg_coords = seg_coords[1:] # Não repetir o nó de conexão
-            full_path_vertices.extend(seg_coords)
-            if len(seg_coords) > 1:
-                seg_length = sum(dist3(seg_coords[j], seg_coords[j+1]) for j in range(len(seg_coords)-1))
-                path_lengths.append(seg_length)
-    except Exception as ex:
-        log("ERROR during chain path: {}".format(ex))
-        success = False
-
-    total_length = sum(path_lengths) if path_lengths else None
+    # Monta pares: [A,B], [B,C], ..., [Z,End]
+    results = []
+    success = 0
+    chain_list = mapped_points + [{"element_id": None, "vertex": end_v, "coord": end_pt, "mapped_distance": end_d}]
+    for i in range(len(chain_list)-1):
+        orig = chain_list[i]
+        dest = chain_list[i+1]
+        eid = orig["element_id"]
+        sv = orig["vertex"]
+        dv = dest["vertex"]
+        mdist = orig["mapped_distance"]
+        try:
+            wire = Graph.ShortestPath(graph, sv, dv, edgeKey="cost", tolerance=TOLERANCE)
+            if not wire:
+                results.append({
+                    "start_index": i,
+                    "element_id": eid,
+                    "length": None,
+                    "vertex_path_xyz": [],
+                    "mapped_distance": mdist
+                })
+                continue
+            wv = Wire.Vertices(wire)
+            path = [x.Coordinates() for x in wv]
+            length = sum(dist3(path[j], path[j+1]) for j in range(len(path)-1))
+            results.append({
+                "start_index": i,
+                "element_id": eid,
+                "length": length,
+                "vertex_path_xyz": path,
+                "mapped_distance": mdist
+            })
+            success += 1
+        except Exception as ex:
+            log("ERROR path element {}: {}".format(eid, ex))
+            results.append({
+                "start_index": i,
+                "element_id": eid,
+                "length": None,
+                "vertex_path_xyz": [],
+                "mapped_distance": mdist
+            })
 
     out = {
         "meta": {
@@ -140,25 +152,18 @@ def main():
             "infra_edges": len(infra_edges),
             "device_edges": len(device_edges),
             "graph_vertices": len(coords),
-            "chain_points": len(chain_vertices),
-            "mapped_chain": len(ordered_points),
-            "success": success,
-            "total_length": total_length,
-            "path_lengths": path_lengths,
-            "mapped_distances": mapped_distances,
+            "chain_points": len(chain_list),
+            "mapped_chain": len(mapped_points),
+            "paths_success": success,
+            "paths_failed": len(chain_list)-1-success,
             "duration_sec": time.time() - t0
         },
-        "results": [{
-            "element_ids": [sp.get("element_id") for sp in starts],
-            "length": total_length,
-            "vertex_path_xyz": full_path_vertices,
-            "mapped_distances": mapped_distances
-        }]
+        "results": results
     }
     out_path = os.path.join(script_dir, "topologic_results.json")
     json.dump(out, open(out_path, "w"), indent=2)
     log("Results written: {}".format(out_path))
-    log("Summary: success={}, total_length={}".format(success, total_length))
+    log("Summary: {} success / {} total".format(success, len(chain_list)-1))
 
 if __name__ == "__main__":
     main()
