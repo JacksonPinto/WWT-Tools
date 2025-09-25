@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Export Infrastructure + Projected L Jumpers (Edge Splitting)
-# Version: 2.7.0 (IronPython)
+# Version: 3.0.0 (IronPython/Revit 2022+ and 2026 tested)
 #
 # Features:
 #   * Builds infrastructure edges (tray/conduit) with curve subdivision (optional).
@@ -26,7 +26,7 @@
 #
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, UV,
-    FamilyInstance, LocationCurve
+    FamilyInstance, LocationCurve, FamilySymbol, BuiltInParameter
 )
 from Autodesk.Revit.UI.Selection import ObjectType
 from pyrevit import forms
@@ -37,8 +37,6 @@ SHOW_SCRIPT_PATH = False
 
 USE_INFRA_CATEGORY_DIALOG  = True
 USE_DEVICE_CATEGORY_DIALOG = True
-ASK_DEVICE_SELECTION_MODE  = True
-DEFAULT_DEVICE_SELECTION_MODE = "all"
 
 # Geometry sampling & tolerances
 SUBDIVIDE_ARCS = True
@@ -171,6 +169,16 @@ def project_point_to_segment(pt, a, b):
     d=dist3(pt,(cx,cy,cz))
     return (cx,cy,cz), t, d
 
+def get_symbol_name(symbol):
+    """Safely get the name of a FamilySymbol."""
+    try:
+        return symbol.Name
+    except:
+        param = symbol.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+        if param:
+            return param.AsString()
+    return "Unknown"
+
 # --- Category selection ---
 infra_category_map=[
     ("Cable Trays", BuiltInCategory.OST_CableTray),
@@ -208,27 +216,94 @@ else:
     dchosen=[n for n,_ in device_category_map]
     device_cat_ids=[cid for _,cid in device_category_map]
 
-if ASK_DEVICE_SELECTION_MODE:
-    mode=forms.SelectFromList.show(["Manual Pick Devices","All Devices In Active View"],
-                                   multiselect=False, title="Device Selection Mode")
-    if not mode: forms.alert("Device selection canceled.", exitscript=True)
-    selection_mode="manual" if mode.startswith("Manual") else "all"
-else:
-    selection_mode=DEFAULT_DEVICE_SELECTION_MODE
+# --- Device selection mode with type filtering ---
+selection_modes = [
+    "Manual Pick Devices",
+    "All Devices In Active View",
+    "Devices Type In Active View"
+]
+mode = forms.SelectFromList.show(selection_modes, multiselect=False, title="Device Selection Mode")
+if not mode:
+    forms.alert("Device selection canceled.", exitscript=True)
+selection_mode = (
+    "manual" if mode.startswith("Manual")
+    else "all" if mode.startswith("All")
+    else "bytype"
+)
 
+selected_type_ids = None
+if selection_mode == "bytype":
+    # Gather all device types (FamilySymbol) in active view for selected categories
+    type_choices = []
+    type_map = {}
+    # Collect all instances to get their typeIds
+    for cid in device_cat_ids:
+        col = FilteredElementCollector(doc, active_view.Id).OfCategory(cid).WhereElementIsNotElementType()
+        for el in col:
+            symbol_id = el.GetTypeId()
+            symbol = doc.GetElement(symbol_id)
+            if symbol is not None:
+                name = get_symbol_name(symbol)
+                cat_name = symbol.Category.Name if symbol.Category else str(cid)
+                pretty = "{} - {}".format(cat_name, name)
+                if pretty not in type_map:  # avoid duplicates
+                    type_choices.append(pretty)
+                    type_map[pretty] = symbol_id
+    if not type_choices:
+        forms.alert("No device types found in active view.", exitscript=True)
+    selected_types = forms.SelectFromList.show(
+        type_choices, title="Select Device Types In Active View", multiselect=True
+    )
+    if not selected_types:
+        forms.alert("No device types selected.", exitscript=True)
+    selected_type_ids = [type_map[name] for name in selected_types]
+
+# --- Collect infrastructure ---
 fitting_cat_set=set([BuiltInCategory.OST_CableTrayFitting, BuiltInCategory.OST_ConduitFitting])
 linear_cat_set =set([BuiltInCategory.OST_CableTray, BuiltInCategory.OST_Conduit])
 
-# --- Collect infrastructure ---
 fittings=[]; linears=[]
-from Autodesk.Revit.DB import LocationCurve
 for cat in infra_cats:
     col=(FilteredElementCollector(doc, active_view.Id).OfCategory(cat).WhereElementIsNotElementType())
     for el in col:
         if cat in fitting_cat_set: fittings.append(el)
         elif cat in linear_cat_set: linears.append(el)
 
-# We'll construct vertex + edge lists incrementally with splitting.
+# --- Device instance collection, now using OfTypeId (Revit 2022+) or fallback ---
+devices=[]
+if selection_mode == "manual":
+    try:
+        refs=uidoc.Selection.PickObjects(ObjectType.Element,"Pick device elements")
+        for r in refs:
+            el=doc.GetElement(r.ElementId)
+            if selected_type_ids is not None:
+                if el.GetTypeId() in selected_type_ids:
+                    devices.append(el)
+            else:
+                devices.append(el)
+    except Exception as e:
+        forms.alert("Device pick aborted:\n{0}".format(e), exitscript=True)
+elif selection_mode == "all":
+    for cid in device_cat_ids:
+        col = FilteredElementCollector(doc, active_view.Id).OfCategory(cid).WhereElementIsNotElementType()
+        for el in col:
+            devices.append(el)
+elif selection_mode == "bytype":
+    # Use OfTypeId for efficiency (Revit 2022+), fallback to python filter if not available
+    try:
+        # Will raise AttributeError if OfTypeId is not available
+        for type_id in selected_type_ids:
+            col = FilteredElementCollector(doc, active_view.Id).OfTypeId(type_id).WhereElementIsNotElementType()
+            for el in col:
+                devices.append(el)
+    except AttributeError:
+        # Fallback: filter all elements by type id
+        for cid in device_cat_ids:
+            col = FilteredElementCollector(doc, active_view.Id).OfCategory(cid).WhereElementIsNotElementType()
+            for el in col:
+                if el.GetTypeId() in selected_type_ids:
+                    devices.append(el)
+
 vertices=[]            # list of [x,y,z]
 vertex_map={}          # norm_key -> index
 infra_edges=[]         # list of [i,j] (after splitting)
@@ -309,22 +384,6 @@ for el in linears:
             linear_curve_edges+=1
 
 # Devices
-devices=[]
-if selection_mode=="manual":
-    try:
-        refs=uidoc.Selection.PickObjects(ObjectType.Element,"Pick device elements")
-        for r in refs:
-            el=doc.GetElement(r.ElementId)
-            if el and el.Category and el.Category.Name in dchosen:
-                devices.append(el)
-    except Exception as e:
-        forms.alert("Device pick aborted:\n{0}".format(e), exitscript=True)
-else:
-    for cid in device_cat_ids:
-        col=(FilteredElementCollector(doc, active_view.Id)
-             .OfCategory(cid).WhereElementIsNotElementType())
-        for el in col: devices.append(el)
-
 device_points=[]
 for d in devices:
     loc=getattr(d,"Location",None)
@@ -342,7 +401,6 @@ try:
 except Exception as e:
     forms.alert("End face selection aborted:\n{0}".format(e), exitscript=True)
 
-from Autodesk.Revit.DB import UV
 def face_center(ref):
     el=doc.GetElement(ref.ElementId)
     geom=el.GetGeometryObjectFromReference(ref)
@@ -360,18 +418,6 @@ if not end_xyz:
 end_idx=add_vertex(end_xyz)  # self-edge not needed; vertex ensures presence
 
 # Build dynamic structure so we can split edges
-# We will store infra_edges as mutable list while splitting
-# Splitting algorithm:
-#   For each device:
-#       Iterate over ALL current infra_edges
-#         compute projection distance
-#       pick best edge (min distance)
-#       if projection interior (t in (0,1) and farther than PROJECTION_ENDPOINT_TOL from both ends):
-#           create new vertex p
-#           replace edge (a,b) with (a,p) and (p,b)
-#       else: use nearest endpoint
-#   Then create L edges from device to p (or endpoint) as configured.
-#
 def split_edge(edge_index, proj_pt, infra_edges):
     a,b = infra_edges[edge_index]
     # remove original
@@ -438,10 +484,8 @@ for d,(dx,dy,dz) in device_points:
         # direct diagonal to projection
         add_edge(device_vertex_idx, proj_vertex_idx, device_edges)
 
-# Deduplicate edges already ensured by add_edge
-
 meta={
-    "version":"2.7.0",
+    "version":"3.0.0",
     "vertex_count":len(vertices),
     "infra_edge_count":len(infra_edges),
     "device_edge_count":len(device_edges),
