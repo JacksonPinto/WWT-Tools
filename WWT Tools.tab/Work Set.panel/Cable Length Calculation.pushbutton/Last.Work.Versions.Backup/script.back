@@ -20,7 +20,7 @@
 #       edges (combined, deduped)
 #       start_points
 #       end_point
-#   * Calls calc_shortest.py then update_cable_lengths.py
+#   * Calls calc_shortest.py or calc_shortest_chain.py then update_cable_lengths.py
 #
 # IronPython safe (no f-strings).
 #
@@ -310,6 +310,24 @@ infra_edges=[]         # list of [i,j] (after splitting)
 fitting_points=[]
 device_edges=[]        # jumper edges (added after projection splitting)
 start_points=[]
+
+# === Escolha do Modo de Cálculo ===
+calc_modes = [
+    "Individual Single Cable (cada dispositivo até o END, modo antigo)",
+    "Daisy Chain Connection (sequência, modo novo)"
+]
+user_mode = forms.SelectFromList.show(
+    calc_modes,
+    title="Modo de cálculo",
+    multiselect=False
+)
+if not user_mode:
+    forms.alert("Cálculo cancelado pelo usuário.", exitscript=True)
+
+if user_mode.startswith("Daisy"):
+    CALC_SCRIPT_NAME = "calc_shortest_chain.py"  # nome do novo script
+else:
+    CALC_SCRIPT_NAME = "calc_shortest.py"        # script antigo, default
 
 def add_vertex(pt):
     nk=norm_key(pt)
