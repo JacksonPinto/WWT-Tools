@@ -13,9 +13,9 @@ from topologicpy.Wire import Wire
 from topologicpy.Dictionary import Dictionary
 
 TOLERANCE = 1e-4
-MAP_TOLERANCE = 1e-3
-DEVICE_EDGE_PENALTY_FACTOR = 1.0
-LOG_PREFIX = "[CHAIN]"
+MAP_TOLERANCE = 1e-4
+DEVICE_EDGE_PENALTY_FACTOR = 1e-4
+LOG_PREFIX = "[CALC]"
 
 def log(msg):
     print("{} {}".format(LOG_PREFIX, msg))
