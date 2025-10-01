@@ -313,8 +313,8 @@ start_points=[]
 
 # === Escolha do Modo de Cálculo ===
 calc_modes = [
-    "Individual Single Cable (cada dispositivo até o END, modo antigo)",
-    "Daisy Chain Connection (sequência, modo novo)"
+    "Individual Single Cable",
+    "Daisy Chain Connection"
 ]
 user_mode = forms.SelectFromList.show(
     calc_modes,
@@ -325,9 +325,9 @@ if not user_mode:
     forms.alert("Cálculo cancelado pelo usuário.", exitscript=True)
 
 if user_mode.startswith("Daisy"):
-    CALC_SCRIPT_NAME = "calc_shortest_chain.py"  # nome do novo script
+    CALC_SCRIPT_NAME = "calc_shortest_chain.py"  # daisy chain script
 else:
-    CALC_SCRIPT_NAME = "calc_shortest.py"        # script antigo, default
+    CALC_SCRIPT_NAME = "calc_shortest.py"        # individual wiring run script
 
 def add_vertex(pt):
     nk=norm_key(pt)

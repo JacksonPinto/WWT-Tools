@@ -12,9 +12,10 @@ from topologicpy.Graph import Graph
 from topologicpy.Wire import Wire
 from topologicpy.Dictionary import Dictionary
 
-TOLERANCE = 1e-4
-MAP_TOLERANCE = 1e-4
-DEVICE_EDGE_PENALTY_FACTOR = 1e-4
+# Updated tolerances to match script.py
+TOLERANCE = 5e-4
+MAP_TOLERANCE = 1
+DEVICE_EDGE_PENALTY_FACTOR = 1e-2
 LOG_PREFIX = "[CALC]"
 
 def log(msg):
