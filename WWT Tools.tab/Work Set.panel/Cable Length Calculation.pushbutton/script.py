@@ -40,7 +40,7 @@ USE_DEVICE_CATEGORY_DIALOG = True
 
 # Geometry sampling & tolerances
 SUBDIVIDE_ARCS = True
-CURVE_SEG_LENGTH_FT = 0.5
+CURVE_SEG_LENGTH_FT = 0.01
 MERGE_TOL = 5e-4               # Vertex merge tolerance
 PROJECTION_ENDPOINT_TOL = 1e-3 # If projection this close to endpoint, reuse endpoint
 ROUND_PREC = 6
@@ -52,7 +52,7 @@ INCLUDE_FITTING_WITHOUT_CONNECTORS = True
 # L jumper segment creation
 CREATE_VERTICAL_SEGMENT = True
 CREATE_HORIZONTAL_SEGMENT = True  # horizontal from vertical point to projection. If False device connects directly (vertical only)
-VERTICAL_MIN_LEN = 1e-6           # treat near zero vertical difference as zero
+VERTICAL_MIN_LEN = 1e-4           # treat near zero vertical difference as zero
 
 # External processing
 PYTHON3_PATH = r"C:\Users\JacksonAugusto\AppData\Local\Programs\Python\Python312\python.exe"
@@ -311,10 +311,10 @@ fitting_points=[]
 device_edges=[]        # jumper edges (added after projection splitting)
 start_points=[]
 
-# === Escolha do Modo de Cálculo ===
+# === Select Connection Mode ===
 calc_modes = [
-    "Individual Single Cable (cada dispositivo até o END, modo antigo)",
-    "Daisy Chain Connection (sequência, modo novo)"
+    "Individual Single Cable",
+    "Daisy Chain Connection"
 ]
 user_mode = forms.SelectFromList.show(
     calc_modes,
