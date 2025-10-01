@@ -16,6 +16,9 @@ To use the tools in this repository, you will need the following:
 - **pyRevit 5.2.0.25181**  
   (You can download this specific version from [pyRevit releases](https://github.com/eirannejad/pyRevit/releases/tag/v5.2.0.25181))
 
+  - **topologicpy 0.8.58**  
+  (You can install this specific version from python console pip install topologicpy --upgrade)
+
 ## How to Use
 
 1. **Install Python 3.12.3**  
