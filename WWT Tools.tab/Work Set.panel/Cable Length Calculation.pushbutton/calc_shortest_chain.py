@@ -82,16 +82,27 @@ def main():
     coords = [v.Coordinates() for v in graph_vertices]
     log("Graph vertices: {}".format(len(coords)))
 
-    # Mapear pontos ordenados da sequência do usuário
+    # ---------------- PATCH: Preserve and log manual sequence (seq_index) ----------------
     mapped_points = []
     for sp in starts:
         coord = sp.get("point")
         eid = sp.get("element_id")
+        seq_index = sp.get("seq_index")  # added
         if not (isinstance(coord, list) and len(coord) == 3): continue
         idx, d = nearest_vertex_index(coord, coords)
         if d > MAP_TOLERANCE:
             log("WARN mapping {} distance {:.6f}".format(eid, d))
-        mapped_points.append({"element_id": eid, "vertex": graph_vertices[idx], "coord": coord, "mapped_distance": d})
+        mapped_points.append({
+            "element_id": eid,
+            "vertex": graph_vertices[idx],
+            "coord": coord,
+            "mapped_distance": d,
+            "seq_index": seq_index
+        })
+    log("Start point sequence (seq_index -> element_id): {}".format(
+        ["{}->{}".format(mp.get("seq_index"), mp.get("element_id")) for mp in mapped_points]
+    ))
+    # ---------------- END PATCH ----------------
 
     if not (isinstance(end_pt, list) and len(end_pt) == 3):
         log("ERROR invalid end point"); sys.exit(1)
@@ -103,7 +114,13 @@ def main():
     # Monta pares: [A,B], [B,C], ..., [Z,End]
     results = []
     success = 0
-    chain_list = mapped_points + [{"element_id": None, "vertex": end_v, "coord": end_pt, "mapped_distance": end_d}]
+    chain_list = mapped_points + [{
+        "element_id": None,
+        "vertex": end_v,
+        "coord": end_pt,
+        "mapped_distance": end_d,
+        "seq_index": None
+    }]
     for i in range(len(chain_list)-1):
         orig = chain_list[i]
         dest = chain_list[i+1]
@@ -111,12 +128,14 @@ def main():
         sv = orig["vertex"]
         dv = dest["vertex"]
         mdist = orig["mapped_distance"]
+        seq_idx = orig.get("seq_index")  # added
         try:
             wire = Graph.ShortestPath(graph, sv, dv, edgeKey="cost", tolerance=TOLERANCE)
             if not wire:
                 results.append({
                     "start_index": i,
                     "element_id": eid,
+                    "seq_index": seq_idx,        # added
                     "length": None,
                     "vertex_path_xyz": [],
                     "mapped_distance": mdist
@@ -128,6 +147,7 @@ def main():
             results.append({
                 "start_index": i,
                 "element_id": eid,
+                "seq_index": seq_idx,            # added
                 "length": length,
                 "vertex_path_xyz": path,
                 "mapped_distance": mdist
@@ -138,6 +158,7 @@ def main():
             results.append({
                 "start_index": i,
                 "element_id": eid,
+                "seq_index": seq_idx,            # added
                 "length": None,
                 "vertex_path_xyz": [],
                 "mapped_distance": mdist

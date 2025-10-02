@@ -461,30 +461,27 @@ def project_device(device_pt):
         i+=1
     return best_edge_index, best_proj, best_t, best_dist
 
-# Process devices
-for d,(dx,dy,dz) in device_points:
+# ---------------- PATCH: Preserve and record explicit manual pick sequence ----------------
+# Add seq_index to each start_points entry and print the order for verification.
+for seq_idx, (d,(dx,dy,dz)) in enumerate(device_points):
     dev_id=to_int_id(d)
     device_vertex_idx = add_vertex((dx,dy,dz))
-    # record start point now (original device coordinate)
     start_points.append({"element_id": dev_id if dev_id is not None else -1,
-                         "point":[dx,dy,dz]})
+                         "point":[dx,dy,dz],
+                         "seq_index": seq_idx})  # << added seq_index
     edge_idx, proj_pt, t_val, pdist = project_device((dx,dy,dz))
     if edge_idx is None:
         continue
     a_idx,b_idx = infra_edges[edge_idx]
     a=vertices[a_idx]; b=vertices[b_idx]
-    # Check closeness to endpoints
     if dist3(proj_pt,a) <= PROJECTION_ENDPOINT_TOL:
         proj_vertex_idx = a_idx
     elif dist3(proj_pt,b) <= PROJECTION_ENDPOINT_TOL:
         proj_vertex_idx = b_idx
     else:
-        # interior split
         proj_vertex_idx = split_edge(edge_idx, proj_pt, infra_edges)
         if DEBUG_PROJECTION:
             cprint("Split edge; new vertex", proj_vertex_idx)
-    # Create L edges
-    # vertical intermediate
     if CREATE_VERTICAL_SEGMENT:
         v_pt = (dx,dy,vertices[proj_vertex_idx][2])
         if abs(v_pt[2]-dz) <= VERTICAL_MIN_LEN:
@@ -495,12 +492,15 @@ for d,(dx,dy,dz) in device_points:
         if CREATE_HORIZONTAL_SEGMENT:
             add_edge(vertical_idx, proj_vertex_idx, device_edges)
         else:
-            # connect device (or vertical) directly if horizontal skipped
             if vertical_idx != proj_vertex_idx:
                 add_edge(vertical_idx, proj_vertex_idx, device_edges)
     else:
-        # direct diagonal to projection
         add_edge(device_vertex_idx, proj_vertex_idx, device_edges)
+
+# Debug print of preserved order
+cprint("Manual pick sequence (seq_index -> element_id):",
+       ["{}->{}".format(sp["seq_index"], sp["element_id"]) for sp in start_points])
+# ---------------- END PATCH ----------------
 
 meta={
     "version":"3.0.0",
