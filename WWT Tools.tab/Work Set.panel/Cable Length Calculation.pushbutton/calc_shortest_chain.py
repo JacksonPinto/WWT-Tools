@@ -33,7 +33,7 @@ VERSION = "9.0.0"
 
 # ---------------- CONFIG ----------------
 TOLERANCE       = 5e-4   # Small merge tolerance (match exporter MERGE_TOL scale)
-SELF_MERGE      = False  # Set True if you need coincident vertices unified (can shorten paths)
+SELF_MERGE      = True  # Set True if you need coincident vertices unified (can shorten paths)
 MAP_TOLERANCE   = 1.0    # Warn if device/end maps farther than this to a graph vertex
 INCLUDE_DEVICE_COORDS = False  # If True, first/last coords in path replaced by original device/end coords
 LOG_PREFIX = "[CALC]"
