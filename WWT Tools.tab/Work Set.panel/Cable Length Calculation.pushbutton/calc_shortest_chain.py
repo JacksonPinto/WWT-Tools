@@ -1,38 +1,24 @@
 #! python3
-# calc_shortest_chain.py  (Reverted style: "version 5" simplified workflow)
+# calc_shortest_chain.py
+# Version: 5.0.0-chain (mirrors calc_shortest.py 3.9.2 logic; adds daisy-chain legs)
 #
-# Workflow:
-#  1. Read topologic.JSON (produced by main script).
-#  2. Build Vertex objects for every JSON vertex.
-#  3. Build Edge objects for every JSON edge (combined list) tagging INFRA vs JUMPER.
-#  4. Flatten: vertices + edges -> Topology.ByGeometry(*geoms)
-#  5. Cluster.ByTopologies(...)
-#  6. Topology.SelfMerge(...)
-#  7. Graph.ByTopology(...)
-#  8. Map ordered start_points (JSON order) and end_point to graph vertices by coordinate.
-#  9. For each consecutive pair (A->B, B->C, ..., lastStart->End) run Graph.ShortestPath.
+# Logic:
+#   1. Read topologic.JSON
+#   2. Build vertices + edges (INFRA + JUMPER)
+#   3. Cluster.ByTopologies -> SelfMerge -> Graph.ByTopology
+#   4. Map start_points to nearest graph vertices in listed order.
+#   5. Legs: (Start0->Start1), (Start1->Start2), ..., (Start{n-2}->Start{n-1}), (Start{n-1}->End)
+#   6. For each leg run Graph.ShortestPath (edgeKey="cost").
+#   7. Path vertices taken from Wire.Vertices (simplified) OR (if EXPAND_EDGES=True) expanded via edge sequence.
 #
-# Output schema (reverted to earlier "working" form):
-# {
-#   "meta": {...},
-#   "results": [
-#       {
-#         "start_index": i,
-#         "element_id": <origin start point element id or None for final leg>,
-#         "length": <path length or None>,
-#         "vertex_path_xyz": [ [x,y,z], ... ],   # expanded from edge sequence (no chord underestimation)
-#         "mapped_distance": <euclidean distance between original start point coordinate and mapped graph vertex>
-#       }, ...
-#   ]
-# }
+# Output: topologic_results.json with one result per leg.
 #
-# Notes:
-# - Uses only the vertices & edges present in topologic.JSON (no device-edge exclusion).
-# - Edge cost = geometric length * DEVICE_EDGE_PENALTY_FACTOR if JUMPER else length.
-# - "vertex_path_xyz" is derived from traversed edge sequence to preserve bends.
-# - If Graph.ShortestPath fails (returns None), length stays None for that leg.
+# NOTE:
+#   DEVICE_EDGE_PENALTY_FACTOR < 1 makes jumper edges cheaper; > 1 penalizes them.
+#   EXPAND_EDGES=False reproduces behavior similar to calc_shortest.py (may simplify bends).
+#   Set EXPAND_EDGES=True to expand each path via traversed edge sequence (preserve bends).
 #
-# Adjust CONFIG values below if needed.
+# Dependencies: topologicpy must be installed in the external Python interpreter used by script.py.
 
 import os, sys, json, math, time
 from topologicpy.Topology import Topology
@@ -43,39 +29,48 @@ from topologicpy.Graph import Graph
 from topologicpy.Wire import Wire
 from topologicpy.Dictionary import Dictionary
 
-# ---------------- CONFIG ----------------
-TOLERANCE = 5e-4                     # Graph / merge tolerance (match main script MERGE_TOL order of magnitude)
-MAP_TOLERANCE = 1.0                  # Max distance allowed when mapping a start/end point to a graph vertex (warning if exceeded)
-DEVICE_EDGE_PENALTY_FACTOR = 1e-2    # Cost multiplier for JUMPER (device) edges ( <1 => cheaper, >1 => penalize )
+# ------------- CONFIG -------------
+TOLERANCE = 5e-4
+MAP_TOLERANCE = 1.0
+DEVICE_EDGE_PENALTY_FACTOR = 1e-4
+EXPAND_EDGES = False  # Set True to preserve all bends via edge sequence
 LOG_PREFIX = "[CALC]"
-# ----------------------------------------
+# ----------------------------------
 
 def log(msg):
     print("{} {}".format(LOG_PREFIX, msg))
 
-def dist3(a,b):
+def dist3(a, b):
     return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2)
 
 def nearest_vertex_index(pt, coords):
-    """Return (index, distance) of nearest coordinate in coords to pt."""
     md = float('inf'); mi = None
-    for i,c in enumerate(coords):
-        d = dist3(pt,c)
+    for i, c in enumerate(coords):
+        d = dist3(pt, c)
         if d < md:
             md = d; mi = i
     return mi, md
 
-def expand_wire_vertices(wire):
-    """
-    Returns (path_vertices_xyz, length) by traversing the wire's edge sequence so that
-    bends are preserved (no chord simplification).
-    """
+def make_edge(i, j, cat, topo_vertices, vertices):
+    v1 = topo_vertices[i]; v2 = topo_vertices[j]
+    e = Edge.ByVertices(v1, v2)
+    length = dist3(vertices[i], vertices[j])
+    cost = length * (DEVICE_EDGE_PENALTY_FACTOR if cat == "JUMPER" else 1.0)
+    d = Dictionary.ByKeysValues(["category", "length", "cost"], [cat, length, cost])
+    try:
+        e.SetDictionary(d)
+    except:
+        pass
+    return e, length
+
+def expand_wire_edges(wire):
+    """Return (coords_list, length) by traversing edge sequence (bend-preserving)."""
     try:
         edges = Wire.Edges(wire)
     except:
         edges = []
     if not edges:
-        # fallback: attempt vertex list only
+        # fallback to simplified vertices
         try:
             vs = Wire.Vertices(wire)
             coords = [v.Coordinates() for v in vs]
@@ -84,7 +79,7 @@ def expand_wire_vertices(wire):
         except:
             return [], None
 
-    path_coords = []
+    coords = []
     total_len = 0.0
     for e in edges:
         try:
@@ -95,22 +90,31 @@ def expand_wire_vertices(wire):
             continue
         c0 = evs[0].Coordinates()
         c1 = evs[-1].Coordinates()
-        # Append first endpoint if starting or different from previous
-        if not path_coords:
-            path_coords.append(c0)
-        else:
-            if path_coords[-1] != c0:
-                path_coords.append(c0)
-        path_coords.append(c1)
+        if not coords:
+            coords.append(c0)
+        elif coords[-1] != c0:
+            coords.append(c0)
+        coords.append(c1)
         total_len += dist3(c0, c1)
 
-    # Deduplicate consecutive duplicates
+    # Deduplicate consecutive
     cleaned = []
-    for c in path_coords:
+    for c in coords:
         if not cleaned or cleaned[-1] != c:
             cleaned.append(c)
-
     return cleaned, total_len
+
+def simplified_wire_vertices(wire):
+    """Return (coords_list, length) using Wire.Vertices (may skip intermediate colinear bends)."""
+    if not wire:
+        return [], None
+    try:
+        vs = Wire.Vertices(wire)
+        coords = [v.Coordinates() for v in vs]
+        length = sum(dist3(coords[i], coords[i+1]) for i in range(len(coords)-1))
+        return coords, length
+    except:
+        return [], None
 
 def main():
     t0 = time.time()
@@ -120,120 +124,131 @@ def main():
         log("ERROR missing topologic.JSON")
         sys.exit(1)
 
-    data = json.load(open(json_path,"r"))
+    data = json.load(open(json_path, "r"))
 
-    vertices_raw   = data.get("vertices", [])
-    infra_edges    = data.get("infra_edges", [])
-    device_edges   = data.get("device_edges", [])
-    combined_edges = data.get("edges", [])  # main script stores combined (infra first then device)
-    starts         = data.get("start_points", [])
-    end_point      = data.get("end_point", None)
-    meta_in        = data.get("meta", {})
+    vertices = data.get("vertices", [])
+    infra_edges = data.get("infra_edges", [])
+    device_edges = data.get("device_edges", [])
+    combined = data.get("edges", [])
+    starts = data.get("start_points", [])
+    end_pt = data.get("end_point", None)
 
-    if not vertices_raw or not combined_edges:
-        log("ERROR empty vertices or edges in JSON.")
+    if not vertices or not combined:
+        log("ERROR vertices or edges missing in JSON")
         sys.exit(1)
 
-    log("Input counts: vertices={} infra_edges={} device_edges={} combined_edges={} start_points={}".format(
-        len(vertices_raw), len(infra_edges), len(device_edges), len(combined_edges), len(starts)
-    ))
+    edges_source = (infra_edges, device_edges) if (infra_edges and device_edges) else (combined, [])
+    log("Vertices:{} InfraEdges:{} DeviceEdges:{} TotalEdges:{} ChainStarts:{} EndPoint:{}"
+        .format(len(vertices), len(infra_edges), len(device_edges), len(combined), len(starts),
+                "Yes" if isinstance(end_pt, list) and len(end_pt)==3 else "No"))
 
-    # 2+3: Build Vertex + Edge objects
-    topo_vertices = [Vertex.ByCoordinates(*v) for v in vertices_raw]
+    # Build topologic vertices
+    topo_vertices = [Vertex.ByCoordinates(*v) for v in vertices]
 
+    # Build edges with cost dictionary
     device_set = set(tuple(sorted(e)) for e in device_edges)
-    edge_objects = []
+    edge_objs = []
+    for (i, j) in edges_source[0]:
+        e,_ = make_edge(i, j, "INFRA", topo_vertices, vertices)
+        edge_objs.append(e)
+    for (i, j) in edges_source[1]:
+        e,_ = make_edge(i, j, "JUMPER", topo_vertices, vertices)
+        edge_objs.append(e)
 
-    for (i,j) in combined_edges:
-        i = int(i); j = int(j)
-        v1 = topo_vertices[i]; v2 = topo_vertices[j]
-        length = dist3(vertices_raw[i], vertices_raw[j])
-        cat = "JUMPER" if tuple(sorted((i,j))) in device_set else "INFRA"
-        cost = length * (DEVICE_EDGE_PENALTY_FACTOR if cat == "JUMPER" else 1.0)
-        d = Dictionary.ByKeysValues(["category","length","cost"], [cat,length,cost])
-        e = Edge.ByVertices(v1, v2)
-        try: e.SetDictionary(d)
-        except: pass
-        edge_objects.append(e)
-
-    # 4: Topology.ByGeometry (all vertices and edges)
-    # (We include vertices explicitly so all are present even if isolated.)
-    geometry_items = topo_vertices + edge_objects
-    topology_geom = Topology.ByGeometry(*geometry_items)
-
-    # 5: Cluster.ByTopologies
-    cluster = Cluster.ByTopologies(topology_geom)
-
-    # 6: SelfMerge (to clean duplicates but keep real corners if tolerance small)
+    # Cluster + SelfMerge + Graph
+    cluster = Cluster.ByTopologies(*edge_objs)
     merged = Topology.SelfMerge(cluster, tolerance=TOLERANCE)
-
-    # 7: Graph.ByTopology
     graph = Graph.ByTopology(merged, tolerance=TOLERANCE)
     graph_vertices = Graph.Vertices(graph)
-    graph_coords = [v.Coordinates() for v in graph_vertices]
-    log("Graph vertex count after merge: {}".format(len(graph_coords)))
+    coords = [v.Coordinates() for v in graph_vertices]
+    log("Graph vertices: {}".format(len(coords)))
 
-    # Helper: map coordinate to nearest graph vertex (within MAP_TOLERANCE)
-    def map_point_to_graph_vertex(pt):
-        idx, d = nearest_vertex_index(pt, graph_coords)
-        gv = graph_vertices[idx]
-        return gv, d, idx
-
-    # 8: Map start points (preserving order)
-    mapped_chain = []
+    # Map start points (ordered)
+    mapped = []
     for sp in starts:
         coord = sp.get("point")
-        eid   = sp.get("element_id")
+        eid = sp.get("element_id")
         if not (isinstance(coord, list) and len(coord) == 3):
             continue
-        gv, d, _ = map_point_to_graph_vertex(coord)
+        idx, d = nearest_vertex_index(coord, coords)
         if d > MAP_TOLERANCE:
-            log("WARN start element {} mapping distance {:.6f}".format(eid, d))
-        mapped_chain.append({
+            log("WARN start {} mapping distance {:.6f}".format(eid, d))
+        mapped.append({
             "element_id": eid,
+            "graph_vertex": graph_vertices[idx],
             "coord": coord,
-            "graph_vertex": gv,
             "mapped_distance": d
         })
 
-    if not (isinstance(end_point, list) and len(end_point) == 3):
-        log("ERROR invalid end point in JSON.")
-        sys.exit(1)
+    if not mapped:
+        log("No valid start points mapped.")
+        out = {
+            "meta": {
+                "version": "5.0.0-chain",
+                "tolerance": TOLERANCE,
+                "map_tolerance": MAP_TOLERANCE,
+                "device_edge_penalty_factor": DEVICE_EDGE_PENALTY_FACTOR,
+                "vertices_input": len(vertices),
+                "graph_vertices": len(coords),
+                "chain_points": 0,
+                "paths_success": 0,
+                "paths_failed": 0,
+                "duration_sec": time.time()-t0
+            },
+            "results": []
+        }
+        json.dump(out, open(os.path.join(script_dir,"topologic_results.json"),"w"), indent=2)
+        sys.exit(0)
 
-    end_gv, end_d, _ = map_point_to_graph_vertex(end_point)
-    if end_d > MAP_TOLERANCE:
-        log("WARN end point mapping distance {:.6f}".format(end_d))
+    # Map end point
+    end_mapped = None
+    end_d = None
+    if isinstance(end_pt, list) and len(end_pt) == 3:
+        end_idx, end_d = nearest_vertex_index(end_pt, coords)
+        if end_d > MAP_TOLERANCE:
+            log("WARN end mapping distance {:.6f}".format(end_d))
+        end_mapped = graph_vertices[end_idx]
+    else:
+        log("WARN missing/invalid end point; last leg will be skipped.")
 
-    # Build full chain list including end as terminal
-    chain_with_end = mapped_chain + [{
-        "element_id": None,
-        "coord": end_point,
-        "graph_vertex": end_gv,
-        "mapped_distance": end_d
-    }]
+    # Build chain legs: consecutive starts + (last start -> end)
+    legs = []
+    for i in range(len(mapped)-1):
+        legs.append((i, mapped[i], mapped[i+1], False))  # (index_of_origin, origin_obj, dest_obj, is_final_to_end=False)
+    if end_mapped:
+        legs.append((len(mapped)-1, mapped[-1], {
+            "element_id": None,
+            "graph_vertex": end_mapped,
+            "coord": end_pt,
+            "mapped_distance": end_d
+        }, True))  # final leg to end
 
-    # 9: Shortest paths for each consecutive pair
     results = []
     success = 0
-    total_legs = len(chain_with_end) - 1
 
-    for i in range(total_legs):
-        orig = chain_with_end[i]
-        dest = chain_with_end[i+1]
-        eid  = orig["element_id"]
-        sv   = orig["graph_vertex"]
-        dv   = dest["graph_vertex"]
-        mdist = orig["mapped_distance"]
-
+    for leg_idx, origin, dest, final_leg in legs:
+        eid = origin["element_id"]
+        sv = origin["graph_vertex"]
+        dv = dest["graph_vertex"]
+        mdist = origin["mapped_distance"]
+        if not sv or not dv:
+            results.append({
+                "start_index": leg_idx,
+                "element_id": eid,
+                "length": None,
+                "vertex_path_xyz": [],
+                "mapped_distance": mdist
+            })
+            continue
         try:
             wire = Graph.ShortestPath(graph, sv, dv, edgeKey="cost", tolerance=TOLERANCE)
         except Exception as ex:
-            log("ERROR path element {} leg {}: {}".format(eid, i, ex))
+            log("ERROR leg {} ({}) path: {}".format(leg_idx, eid, ex))
             wire = None
 
         if not wire:
             results.append({
-                "start_index": i,
+                "start_index": leg_idx,
                 "element_id": eid,
                 "length": None,
                 "vertex_path_xyz": [],
@@ -241,51 +256,48 @@ def main():
             })
             continue
 
-        path_coords, path_len = expand_wire_vertices(wire)
-        if path_coords and path_len is not None:
-            success += 1
-            results.append({
-                "start_index": i,
-                "element_id": eid,
-                "length": path_len,
-                "vertex_path_xyz": path_coords,
-                "mapped_distance": mdist
-            })
+        if EXPAND_EDGES:
+            coords_path, path_len = expand_wire_edges(wire)
         else:
-            results.append({
-                "start_index": i,
-                "element_id": eid,
-                "length": None,
-                "vertex_path_xyz": [],
-                "mapped_distance": mdist
-            })
+            coords_path, path_len = simplified_wire_vertices(wire)
+
+        results.append({
+            "start_index": leg_idx,
+            "element_id": eid,
+            "length": path_len,
+            "vertex_path_xyz": coords_path,
+            "mapped_distance": mdist
+        })
+        if path_len is not None:
+            success += 1
 
     out = {
         "meta": {
-            "version": "CHAIN-1.0.0",
+            "version": "5.0.0-chain",
             "tolerance": TOLERANCE,
             "map_tolerance": MAP_TOLERANCE,
             "device_edge_penalty_factor": DEVICE_EDGE_PENALTY_FACTOR,
-            "vertices_input": len(vertices_raw),
-            "combined_edges": len(combined_edges),
+            "vertices_input": len(vertices),
             "infra_edges": len(infra_edges),
             "device_edges": len(device_edges),
-            "graph_vertices": len(graph_coords),
-            "chain_points": len(chain_with_end),
-            "mapped_chain": len(mapped_chain),
+            "combined_edges": len(combined),
+            "graph_vertices": len(coords),
+            "chain_points": len(mapped) + (1 if end_mapped else 0),
+            "start_points": len(mapped),
+            "end_point_present": bool(end_mapped),
+            "legs_total": len(legs),
             "paths_success": success,
-            "paths_failed": total_legs - success,
+            "paths_failed": len(legs) - success,
+            "expand_edges": EXPAND_EDGES,
             "duration_sec": time.time() - t0
         },
         "results": results
     }
 
     out_path = os.path.join(script_dir, "topologic_results.json")
-    with open(out_path, "w") as f:
-        json.dump(out, f, indent=2)
-
+    json.dump(out, open(out_path, "w"), indent=2)
     log("Results written: {}".format(out_path))
-    log("Summary: {} success / {} total legs".format(success, total_legs))
+    log("Summary: {} success / {} legs".format(success, len(legs)))
 
 if __name__ == "__main__":
     main()
