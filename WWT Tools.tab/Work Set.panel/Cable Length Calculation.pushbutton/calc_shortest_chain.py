@@ -33,7 +33,7 @@ from topologicpy.Dictionary import Dictionary
 TOLERANCE = 5e-4
 MAP_TOLERANCE = 1.0
 DEVICE_EDGE_PENALTY_FACTOR = 1e-4
-EXPAND_EDGES = False  # Set True to preserve all bends via edge sequence
+EXPAND_EDGES = True  # Set True to preserve all bends via edge sequence
 LOG_PREFIX = "[CALC]"
 # ----------------------------------
 
