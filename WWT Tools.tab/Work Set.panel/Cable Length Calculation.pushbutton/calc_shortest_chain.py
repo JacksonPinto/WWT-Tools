@@ -1,24 +1,23 @@
 #! python3
 # calc_shortest_chain.py
-# Strict Daisy Chain (INFRA-ONLY interior) Version 6.0.0
+# Version: 7.0.0 (Infrastructure-only, candidate mapping, detour elimination)
 #
-# Enforces that inter-device routing follows ONLY infrastructure edges.
-# Device (jumper) edges are used only to measure the local connection from each
-# device to the nearest infrastructure vertex.
+# Daisy-chain: (Start0->Start1) (Start1->Start2) ... (Start{n-2}->Start{n-1}) (Start{n-1}->End)
 #
-# PATH LENGTH (per leg i -> i+1):
-#   len = device_i_to_infra + shortest_path_along_infra + infra_to_device_i+1
+# GOALS:
+#   * Use only infrastructure edges (infra_edges) for interior path.
+#   * Do not introduce artificial intermediate vertices that cause detours.
+#   * Enumerate multiple candidate infra vertices around each device and choose the pair
+#     that minimizes the infra shortest path length for the leg.
+#   * Optionally snap device coordinates directly to the chosen infra vertex (zero local segment).
+#   * Output either full infra path (expanded) or just [device_start, device_end].
 #
-# OUTPUT vertex_path_xyz:
-#   [device_i_point] + [infra path vertex coords in order (including mapped start infra vertex first)] + [device_i+1_point]
+# OUTPUT:
+#   topologic_results.json with:
+#     - For each leg: chosen start/end infra vertex indices, candidate counts, path length.
+#     - vertex_path_xyz: start device, full infra path (if OUTPUT_ONLY_DEVICE_AND_END=False), end device.
 #
-# If end point exists the last leg is (last_device -> end_point) using same logic (end counts as "device" without element_id).
-#
-# OPTIONAL: If USE_DEVICE_EDGE_GEOMETRY = True attempts to find actual device edge(s) in device_edges
-# connecting a device vertex to its mapped infra vertex; if found, uses the precise length (sum of
-# those edge lengths) instead of direct straight-line distance.
-#
-# REQUIREMENT: topologicpy must be installed in external CPython interpreter.
+# DEPENDENCY: topologicpy installed in external Python interpreter invoked by main script.
 
 import os, sys, json, math, time
 from topologicpy.Vertex import Vertex
@@ -28,34 +27,53 @@ from topologicpy.Topology import Topology
 from topologicpy.Graph import Graph
 from topologicpy.Wire import Wire
 
-VERSION = "6.0.0-INFRA_ONLY"
+VERSION = "7.0.0"
 
 # ---------------- CONFIG ----------------
-INFRA_TOLERANCE = 5e-4
-MAP_TOLERANCE = 1.0
-USE_DEVICE_EDGE_GEOMETRY = True
-SEARCH_RADIUS_FOR_DEVICE_EDGE = 1.0  # feet: max distance allowed between a device point and a vertex coord to consider as same
+INFRA_TOLERANCE = 5e-4              # Merge tolerance for infra graph
+MAP_TOLERANCE   = 1.0               # Warn if mapping distance > this
+CANDIDATE_SEARCH_RADIUS_FT = 1.0    # Radius to collect candidate infra vertices around each device
+MAX_START_CANDIDATES = 8            # Safety cap
+MAX_END_CANDIDATES   = 8
+SNAP_DEVICE_TO_VERTEX = True        # If True: vertex_path_xyz uses exact infra vertex coords for device points
+OUTPUT_ONLY_DEVICE_AND_END = False  # If True: only [device_start, device_end] in vertex_path_xyz
+STRICT_INFRA_LENGTH = True          # Compute length from actual edge segments in Wire (if possible)
+LOG_VERBOSE = True
 LOG_PREFIX = "[CALC]"
 # ----------------------------------------
 
-def log(msg):
+def log(msg, verbose=False):
+    if verbose and not LOG_VERBOSE:
+        return
     print("{} {}".format(LOG_PREFIX, msg))
 
 def dist3(a,b):
-    return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2)
+    return math.sqrt((a[0]-b[0])**2+(a[1]-b[1])**2+(a[2]-b[2])**2)
 
 def nearest_vertex_index(pt, coords):
-    md=float('inf'); mi=None
+    best=None; bd=1e9
     for i,c in enumerate(coords):
         d=dist3(pt,c)
-        if d<md:
-            md=d; mi=i
-    return mi, md
+        if d<bd:
+            bd=d; best=i
+    return best, bd
+
+def find_candidates(pt, coords, radius, limit):
+    """Return list of (index, distance) for coords within radius, sorted by distance, truncated by limit.
+       Always include the nearest even if outside radius (fallback)."""
+    idx, d0 = nearest_vertex_index(pt, coords)
+    cand=[]
+    for i,c in enumerate(coords):
+        d=dist3(pt,c)
+        if d<=radius: cand.append((i,d))
+    if not cand:  # no one inside radius, use nearest
+        cand=[(idx,d0)]
+    cand.sort(key=lambda x:x[1])
+    if len(cand)>limit: cand=cand[:limit]
+    return cand
 
 def build_infra_graph(vertices, infra_edges):
-    """Return (graph, topo_vertices, vertex_coords_map, infra_vertex_objects)."""
-    topo_vertices = [Vertex.ByCoordinates(*v) for v in vertices]
-
+    topo_vertices=[Vertex.ByCoordinates(*v) for v in vertices]
     edge_objs=[]
     for (i,j) in infra_edges:
         v1=topo_vertices[i]; v2=topo_vertices[j]
@@ -64,89 +82,58 @@ def build_infra_graph(vertices, infra_edges):
             edge_objs.append(e)
         except:
             pass
+    cluster=Cluster.ByTopologies(*edge_objs)
+    merged=Topology.SelfMerge(cluster,tolerance=INFRA_TOLERANCE)
+    graph=Graph.ByTopology(merged,tolerance=INFRA_TOLERANCE)
+    graph_vertices=Graph.Vertices(graph)
+    coords=[gv.Coordinates() for gv in graph_vertices]
+    return graph, graph_vertices, coords
 
-    cluster = Cluster.ByTopologies(*edge_objs)
-    merged = Topology.SelfMerge(cluster, tolerance=INFRA_TOLERANCE)
-    graph = Graph.ByTopology(merged, tolerance=INFRA_TOLERANCE)
-    gvs = Graph.Vertices(graph)
-    gcoords=[v.Coordinates() for v in gvs]
-    return graph, topo_vertices, gcoords, gvs
-
-def dijkstra_infra(graph, sv, dv):
-    """Use Topologic Graph.ShortestPath (it internally uses costs=length)."""
-    try:
-        wire = Graph.ShortestPath(graph, sv, dv, tolerance=INFRA_TOLERANCE)
-        return wire
-    except Exception as ex:
-        log("ERROR shortest path: {}".format(ex))
-        return None
-
-def expand_wire_vertices(wire):
-    """Expand path with all intermediate wire vertices (not edges)."""
+def wire_length_and_coords(wire, strict=True):
     if not wire:
-        return [], None
+        return None, []
+    if strict:
+        # Use edges so we sum true segment lengths
+        try:
+            edges=Wire.Edges(wire)
+        except:
+            edges=[]
+        if edges:
+            coords=[]
+            total=0.0
+            for e in edges:
+                try:
+                    ev=Edge.Vertices(e)
+                except:
+                    ev=[]
+                if len(ev)<2: continue
+                c0=ev[0].Coordinates(); c1=ev[-1].Coordinates()
+                if not coords:
+                    coords.append(c0)
+                elif coords[-1]!=c0:
+                    coords.append(c0)
+                coords.append(c1)
+                total+=dist3(c0,c1)
+            # Deduplicate consecutives
+            clean=[]
+            for c in coords:
+                if not clean or clean[-1]!=c:
+                    clean.append(c)
+            return total, clean
+    # Fallback simplified
     try:
-        wv = Wire.Vertices(wire)
-        coords=[v.Coordinates() for v in wv]
-        length=sum(dist3(coords[i], coords[i+1]) for i in range(len(coords)-1))
-        return coords, length
+        vs=Wire.Vertices(wire)
+        coords=[v.Coordinates() for v in vs]
+        total=sum(dist3(coords[i],coords[i+1]) for i in range(len(coords)-1))
+        return total, coords
     except:
-        return [], None
+        return None, []
 
-def try_device_local_length(device_point, infra_coord, vertices, device_edges, device_vertex_index_cache, device_vertex_xyz_cache):
-    """
-    Attempts to find actual device edge chain from a device point to the infra vertex
-    by searching for a vertex in 'vertices' matching device_point, then following
-    device_edges to an infra vertex whose coordinate matches infra_coord (within small tolerance).
-    Returns (length, chain_coords) or (None, None) if not found.
-    """
-    tol = 1e-6
-    # Build a mapping once
-    if not device_vertex_index_cache:
-        # Accept any vertex from the export whose coordinate is exactly device coordinates
-        for idx, v in enumerate(vertices):
-            device_vertex_xyz_cache[idx] = tuple(v)
-    # Find closest vertex to device_point
-    best_idx=None; best_d=1e9
-    for idx, c in device_vertex_xyz_cache.items():
-        d=dist3(device_point, c)
-        if d<best_d:
-            best_d=d; best_idx=idx
-    if best_d>SEARCH_RADIUS_FOR_DEVICE_EDGE:
-        return None, None  # device point not near any existing vertex (maybe main script didn't create explicit device vertex)
-    # BFS limited to device_edges
-    dev_adj={}
-    for a,b in device_edges:
-        dev_adj.setdefault(a,[]).append(b)
-        dev_adj.setdefault(b,[]).append(a)
-    # We also need to know candidate infra target vertex index (nearest to infra_coord)
-    # If multiple infra vertices share same coord within tol, any is fine.
-    target_candidate=None; target_d=1e9
-    for idx,c in device_vertex_xyz_cache.items():
-        d=dist3(infra_coord,c)
-        if d<target_d:
-            target_d=d; target_candidate=idx
-    if target_candidate is None or target_d>SEARCH_RADIUS_FOR_DEVICE_EDGE:
-        return None, None
-
-    from collections import deque
-    q=deque([(best_idx, [best_idx])])
-    visited=set([best_idx])
-    found_path=None
-    while q:
-        cur, path = q.popleft()
-        if cur==target_candidate:
-            found_path=path
-            break
-        for nb in dev_adj.get(cur,[]):
-            if nb not in visited:
-                visited.add(nb)
-                q.append((nb, path+[nb]))
-    if not found_path:
-        return None, None
-    coords=[device_vertex_xyz_cache[i] for i in found_path]
-    length=sum(dist3(coords[i], coords[i+1]) for i in range(len(coords)-1))
-    return length, coords
+def shortest_path(graph, gv_start, gv_end):
+    try:
+        return Graph.ShortestPath(graph, gv_start, gv_end, tolerance=INFRA_TOLERANCE)
+    except:
+        return None
 
 def main():
     t0=time.time()
@@ -154,198 +141,183 @@ def main():
     json_path=os.path.join(script_dir,"topologic.JSON")
     if not os.path.isfile(json_path):
         log("ERROR missing topologic.JSON"); sys.exit(1)
-
     data=json.load(open(json_path,"r"))
 
-    vertices      = data.get("vertices",[])
-    infra_edges   = data.get("infra_edges",[])
-    device_edges  = data.get("device_edges",[])
-    combined      = data.get("edges",[])
-    starts        = data.get("start_points",[])
-    end_pt        = data.get("end_point",None)
+    vertices=data.get("vertices",[])
+    infra_edges=data.get("infra_edges",[])
+    device_edges=data.get("device_edges",[])  # not used interior
+    starts=data.get("start_points",[])
+    end_pt=data.get("end_point",None)
 
-    log("INPUT vertices={} infra_edges={} device_edges={} combined_edges={} start_points={}".format(
-        len(vertices), len(infra_edges), len(device_edges), len(combined), len(starts)
+    log("Input: vertices={} infra_edges={} device_edges={} starts={}".format(
+        len(vertices), len(infra_edges), len(device_edges), len(starts)
     ))
 
-    if not vertices or not infra_edges:
-        log("ERROR: Missing essential infra graph data.")
+    if not vertices or not infra_edges or len(starts)<2:
+        log("ERROR need at least 2 start points and infra graph.")
         sys.exit(1)
 
-    graph, topo_vertices, gcoords, gverts = build_infra_graph(vertices, infra_edges)
+    graph, gverts, gcoords = build_infra_graph(vertices, infra_edges)
     log("Infra graph vertices: {}".format(len(gcoords)))
 
-    # Map each start point to nearest infra graph vertex
-    mapped_starts=[]
-    for sp in starts:
+    # Map device start points to candidate infra vertices
+    device_chain = starts[:]  # preserve order
+    if isinstance(end_pt,list) and len(end_pt)==3:
+        device_chain = device_chain + [{"element_id": None, "point": end_pt}]
+    else:
+        log("WARN no end point; chain ends with last start.")
+
+    # Precompute candidate lists per device
+    device_candidates=[]
+    for idx, sp in enumerate(device_chain):
         coord=sp.get("point")
         eid=sp.get("element_id")
         if not (isinstance(coord,list) and len(coord)==3):
+            log("WARN invalid coord at chain index {}".format(idx))
+            device_candidates.append([])
             continue
-        gi, md = nearest_vertex_index(coord, gcoords)
-        if md>MAP_TOLERANCE:
-            log("WARN start {} mapping distance {:.6f}".format(eid, md))
-        mapped_starts.append({
-            "element_id": eid,
-            "device_coord": coord,
-            "graph_vertex": gverts[gi],
-            "graph_coord": gcoords[gi],
-            "map_dist": md
-        })
+        cand=find_candidates(coord, gcoords, CANDIDATE_SEARCH_RADIUS_FT,
+                             MAX_START_CANDIDATES if idx < len(device_chain)-1 else MAX_END_CANDIDATES)
+        # Always sort by distance
+        device_candidates.append(cand)
+        if LOG_VERBOSE:
+            log("Device {} (eid={}): {} candidates".format(idx, eid, len(cand)), verbose=True)
 
-    # Map end point
-    end_mapped=None
-    if isinstance(end_pt,list) and len(end_pt)==3:
-        ei, ed = nearest_vertex_index(end_pt, gcoords)
-        if ed>MAP_TOLERANCE:
-            log("WARN end mapping distance {:.6f}".format(ed))
-        end_mapped={
-            "element_id": None,
-            "device_coord": end_pt,
-            "graph_vertex": gverts[ei],
-            "graph_coord": gcoords[ei],
-            "map_dist": ed
-        }
-    else:
-        log("WARN No valid end point present; last leg to end omitted.")
-
-    # Build chain (A->B->... last -> End)
-    chain_nodes = mapped_starts + ([end_mapped] if end_mapped else [])
-    legs=[]
-    for i in range(len(chain_nodes)-1):
-        legs.append((i, chain_nodes[i], chain_nodes[i+1]))
-
-    log("Leg count: {}".format(len(legs)))
-
-    # Pre-cache for device edge search (if enabled)
-    device_vertex_index_cache=True
-    device_vertex_xyz_cache={}
     results=[]
     success=0
 
-    for leg_index, start_node, dest_node in legs:
-        start_eid = start_node["element_id"]
-        s_dev = start_node["device_coord"]
-        s_inf = start_node["graph_coord"]
-        d_dev = dest_node["device_coord"]
-        d_inf = dest_node["graph_coord"]
+    # Iterate through legs
+    for leg_index in range(len(device_chain)-1):
+        origin=device_chain[leg_index]
+        dest  =device_chain[leg_index+1]
+        origin_coord=origin["point"]; dest_coord=dest["point"]
+        origin_eid=origin["element_id"]
 
-        # 1. local connection lengths (device->infra) at start & at dest
-        if USE_DEVICE_EDGE_GEOMETRY:
-            s_local_len, s_local_coords = try_device_local_length(
-                tuple(s_dev), tuple(s_inf), vertices, device_edges,
-                device_vertex_index_cache, device_vertex_xyz_cache
-            )
-            d_local_len, d_local_coords = try_device_local_length(
-                tuple(d_dev), tuple(d_inf), vertices, device_edges,
-                device_vertex_index_cache, device_vertex_xyz_cache
-            )
-        else:
-            s_local_len, s_local_coords = None, None
-            d_local_len, d_local_coords = None, None
+        origin_cands=device_candidates[leg_index]
+        dest_cands  =device_candidates[leg_index+1]
 
-        if s_local_len is None:
-            s_local_len = dist3(s_dev, s_inf)
-            s_local_coords = [tuple(s_dev), tuple(s_inf)]
-        if d_local_len is None:
-            d_local_len = dist3(d_inf, d_dev)
-            d_local_coords = [tuple(d_inf), tuple(d_dev)]
+        best_len=None
+        best_wire=None
+        best_pair=None
+        best_coords=None
 
-        # 2. shortest path along infra graph between s_inf vertex and d_inf vertex
-        wire = dijkstra_infra(graph, start_node["graph_vertex"], dest_node["graph_vertex"])
-        if not wire:
-            log("WARN no infra path leg {} (start eid={})".format(leg_index, start_eid))
+        # Try all candidate pairs
+        for (oi, odist) in origin_cands:
+            gv_start=gverts[oi]
+            for (di, ddist) in dest_cands:
+                gv_end=gverts[di]
+                wire=shortest_path(graph, gv_start, gv_end)
+                if not wire:
+                    continue
+                wlen, wcoords = wire_length_and_coords(wire, strict=STRICT_INFRA_LENGTH)
+                if wlen is None:
+                    continue
+                total_leg_len=wlen  # (No local device->vertex segments unless SNAP_DEVICE_TO_VERTEX False)
+                # Add local offsets if not snapping:
+                if not SNAP_DEVICE_TO_VERTEX:
+                    total_leg_len += dist3(origin_coord, wcoords[0]) + dist3(wcoords[-1], dest_coord)
+
+                if (best_len is None) or (total_leg_len < best_len):
+                    best_len=total_leg_len
+                    best_wire=wire
+                    best_pair=(oi, di, odist, ddist)
+                    best_coords=wcoords
+
+        if best_len is None:
+            log("WARN leg {} (eid {}) no path found among candidates".format(leg_index, origin_eid))
             results.append({
                 "start_index": leg_index,
-                "element_id": start_eid,
+                "element_id": origin_eid,
                 "length": None,
                 "vertex_path_xyz": [],
-                "mapped_distance": start_node["map_dist"]
+                "mapped_start_candidates": len(origin_cands),
+                "mapped_end_candidates": len(dest_cands)
             })
             continue
 
-        infra_coords, infra_len = expand_wire_vertices(wire)
-        if infra_len is None:
-            log("WARN empty infra path leg {} (start eid={})".format(leg_index, start_eid))
-            results.append({
-                "start_index": leg_index,
-                "element_id": start_eid,
-                "length": None,
-                "vertex_path_xyz": [],
-                "mapped_distance": start_node["map_dist"]
-            })
-            continue
-
-        # 3. build final coordinate path:
-        # device start -> (device->infra local chain without repeating infra first point) -> infra path (without duplicating first) -> (infra->device local) -> device end
-        full_coords=[]
-
-        # start device
-        full_coords.append(tuple(s_dev))
-
-        # remove first duplicate in s_local_coords if it equals s_dev
-        sc_seq = s_local_coords[:]
-        if sc_seq and sc_seq[0] == tuple(s_dev):
-            sc_seq = sc_seq[1:]
-        # also drop last if equals first infra coord in infra path (to avoid duplicates)
-        if sc_seq and infra_coords and sc_seq[-1] == infra_coords[0]:
-            pass
-        full_coords.extend(sc_seq)
-
-        # add infra path (drop first if already in list)
-        if full_coords and infra_coords and full_coords[-1] == infra_coords[0]:
-            full_coords.extend(infra_coords[1:])
+        # Build output coordinate path
+        if OUTPUT_ONLY_DEVICE_AND_END:
+            if SNAP_DEVICE_TO_VERTEX:
+                # Snap to start/end of chosen graph path
+                start_snap = best_coords[0]
+                end_snap   = best_coords[-1]
+                path_xyz=[list(start_snap), list(end_snap)]
+            else:
+                path_xyz=[origin_coord, dest_coord]
         else:
-            full_coords.extend(infra_coords)
+            # Full infra path
+            path_xyz=[]
+            if SNAP_DEVICE_TO_VERTEX:
+                # Use origin snapped to first infra coord
+                path_xyz.append(list(best_coords[0]))
+            else:
+                path_xyz.append(origin_coord)
+                # ensure not duplicating
+                if best_coords and origin_coord!=best_coords[0]:
+                    path_xyz.append(list(best_coords[0]))
+            # interior
+            for c in best_coords[1:-1]:
+                path_xyz.append(list(c))
+            # destination
+            if SNAP_DEVICE_TO_VERTEX:
+                path_xyz.append(list(best_coords[-1]))
+            else:
+                if best_coords and dest_coord!=best_coords[-1]:
+                    path_xyz.append(list(best_coords[-1]))
+                path_xyz.append(dest_coord)
 
-        # dest local connection (from infra to device end)
-        dc_seq = d_local_coords[:]
-        # remove first if it equals last infra coord
-        if dc_seq and full_coords and dc_seq[0] == full_coords[-1]:
-            dc_seq = dc_seq[1:]
-        # ensure final device point present
-        # last element of dc_seq should be device dest
-        full_coords.extend(dc_seq)
-
-        # 4. compute total length (local + infra)
-        total_len = s_local_len + infra_len + d_local_len
+        if LOG_VERBOSE:
+            oi, di, od, dd = best_pair
+            log("Leg {} eid {}: chosen startV={} endV={} infraLen={:.6f} totalLen={:.6f} startMapDist={:.4f} endMapDist={:.4f}"
+                .format(leg_index, origin_eid, oi, di, best_len if SNAP_DEVICE_TO_VERTEX else best_len - (dist3(origin_coord,best_coords[0])+dist3(best_coords[-1],dest_coord)),
+                        best_len, od, dd), verbose=True)
 
         results.append({
             "start_index": leg_index,
-            "element_id": start_eid,
-            "length": total_len,
-            "vertex_path_xyz": [list(c) for c in full_coords],
-            "mapped_distance": start_node["map_dist"],
-            "device_local_start_len": s_local_len,
-            "device_local_end_len": d_local_len,
-            "infra_len": infra_len
+            "element_id": origin_eid,
+            "length": best_len,
+            "vertex_path_xyz": path_xyz,
+            "mapped_start_candidates": len(origin_cands),
+            "mapped_end_candidates": len(dest_cands),
+            "chosen_start_vertex_index": best_pair[0],
+            "chosen_end_vertex_index": best_pair[1],
+            "start_map_distance": best_pair[2],
+            "end_map_distance": best_pair[3],
+            "snapped": SNAP_DEVICE_TO_VERTEX,
+            "output_only_devices": OUTPUT_ONLY_DEVICE_AND_END
         })
-        success += 1
+        success+=1
 
-    out = {
+    out={
         "meta":{
             "version": VERSION,
             "infra_tolerance": INFRA_TOLERANCE,
             "map_tolerance": MAP_TOLERANCE,
-            "use_device_edge_geometry": USE_DEVICE_EDGE_GEOMETRY,
+            "candidate_radius": CANDIDATE_SEARCH_RADIUS_FT,
+            "max_start_candidates": MAX_START_CANDIDATES,
+            "max_end_candidates": MAX_END_CANDIDATES,
+            "snap_device_to_vertex": SNAP_DEVICE_TO_VERTEX,
+            "output_only_device_and_end": OUTPUT_ONLY_DEVICE_AND_END,
+            "strict_infra_length": STRICT_INFRA_LENGTH,
             "vertices_input": len(vertices),
             "infra_edges": len(infra_edges),
             "device_edges": len(device_edges),
             "graph_vertices": len(gcoords),
-            "chain_points": len(chain_nodes),
-            "legs_total": len(legs),
+            "start_points": len(starts),
+            "chain_points": len(device_chain),
+            "legs_total": len(results),
             "paths_success": success,
-            "paths_failed": len(legs)-success,
+            "paths_failed": len(results)-success,
             "duration_sec": time.time()-t0
         },
         "results": results
     }
 
-    out_path = os.path.join(script_dir,"topologic_results.json")
+    out_path=os.path.join(script_dir,"topologic_results.json")
     with open(out_path,"w") as f:
         json.dump(out,f,indent=2)
     log("Results written: {}".format(out_path))
-    log("Summary: {} success / {} legs".format(success, len(legs)))
+    log("Summary: {} success / {} legs".format(success, len(results)))
 
 if __name__ == "__main__":
     main()
