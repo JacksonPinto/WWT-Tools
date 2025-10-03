@@ -1,23 +1,24 @@
 #! python3
 # calc_shortest_chain.py
-# Version: 7.0.0 (Infrastructure-only, candidate mapping, detour elimination)
+# Version: 8.0.0 (Minimal chain: pure Topologic Graph.ShortestPath with edgeKey='length')
 #
-# Daisy-chain: (Start0->Start1) (Start1->Start2) ... (Start{n-2}->Start{n-1}) (Start{n-1}->End)
+# Steps:
+#   1. Read topologic.JSON (expects "vertices", "edges", "start_points", "end_point")
+#   2. Create Vertex objects in original order.
+#   3. Create Edge objects for EVERY combined edge; assign dictionary with key 'length'.
+#   4. (Optional) SelfMerge OFF by default to prevent corner loss.
+#   5. Graph.ByTopology
+#   6. For each consecutive start pair + last start to end: map each device/end to nearest graph vertex.
+#   7. Compute Graph.ShortestPath(graph, vA, vB, edgeKey='length').
+#   8. Expand wire edges => ordered coordinates, sum edge 'length' dictionary values.
 #
-# GOALS:
-#   * Use only infrastructure edges (infra_edges) for interior path.
-#   * Do not introduce artificial intermediate vertices that cause detours.
-#   * Enumerate multiple candidate infra vertices around each device and choose the pair
-#     that minimizes the infra shortest path length for the leg.
-#   * Optionally snap device coordinates directly to the chosen infra vertex (zero local segment).
-#   * Output either full infra path (expanded) or just [device_start, device_end].
+# No device jumper penalties, no candidate expansions, no added synthetic points.
+# Output lengths should align with the exact sum of the edges Topologic selects.
 #
-# OUTPUT:
-#   topologic_results.json with:
-#     - For each leg: chosen start/end infra vertex indices, candidate counts, path length.
-#     - vertex_path_xyz: start device, full infra path (if OUTPUT_ONLY_DEVICE_AND_END=False), end device.
+# If a device coordinate is not exactly a graph vertex we map to the nearest one;
+# only that graph vertex appears in the path (as per your instruction to "use only the 2 points start / end").
 #
-# DEPENDENCY: topologicpy installed in external Python interpreter invoked by main script.
+# CONFIG toggles below allow minor adjustments.
 
 import os, sys, json, math, time
 from topologicpy.Vertex import Vertex
@@ -26,288 +27,215 @@ from topologicpy.Cluster import Cluster
 from topologicpy.Topology import Topology
 from topologicpy.Graph import Graph
 from topologicpy.Wire import Wire
+from topologicpy.Dictionary import Dictionary
 
-VERSION = "7.0.0"
+VERSION = "8.0.0"
 
 # ---------------- CONFIG ----------------
-INFRA_TOLERANCE = 5e-4              # Merge tolerance for infra graph
-MAP_TOLERANCE   = 1.0               # Warn if mapping distance > this
-CANDIDATE_SEARCH_RADIUS_FT = 1.0    # Radius to collect candidate infra vertices around each device
-MAX_START_CANDIDATES = 8            # Safety cap
-MAX_END_CANDIDATES   = 8
-SNAP_DEVICE_TO_VERTEX = True        # If True: vertex_path_xyz uses exact infra vertex coords for device points
-OUTPUT_ONLY_DEVICE_AND_END = False  # If True: only [device_start, device_end] in vertex_path_xyz
-STRICT_INFRA_LENGTH = True          # Compute length from actual edge segments in Wire (if possible)
-LOG_VERBOSE = True
-LOG_PREFIX = "[CALC]"
+TOLERANCE          = 1e-9     # Very small to avoid merging if SELF_MERGE=False
+SELF_MERGE         = True    # Set True if you must collapse coincident duplicates (may shorten paths)
+MAP_TOLERANCE      = 1.0      # Warn if device->nearest vertex distance exceeds this
+INCLUDE_DEVICE_COORDS = False # If True prepend/append original device/end coords to path list (for reference)
+LOG_PREFIX         = "[CALC]"
 # ----------------------------------------
 
-def log(msg, verbose=False):
-    if verbose and not LOG_VERBOSE:
-        return
+def log(msg):
     print("{} {}".format(LOG_PREFIX, msg))
 
 def dist3(a,b):
     return math.sqrt((a[0]-b[0])**2+(a[1]-b[1])**2+(a[2]-b[2])**2)
 
 def nearest_vertex_index(pt, coords):
-    best=None; bd=1e9
+    bd = float('inf'); bi = None
     for i,c in enumerate(coords):
-        d=dist3(pt,c)
-        if d<bd:
-            bd=d; best=i
-    return best, bd
+        d = dist3(pt,c)
+        if d < bd:
+            bd = d; bi = i
+    return bi, bd
 
-def find_candidates(pt, coords, radius, limit):
-    """Return list of (index, distance) for coords within radius, sorted by distance, truncated by limit.
-       Always include the nearest even if outside radius (fallback)."""
-    idx, d0 = nearest_vertex_index(pt, coords)
-    cand=[]
-    for i,c in enumerate(coords):
-        d=dist3(pt,c)
-        if d<=radius: cand.append((i,d))
-    if not cand:  # no one inside radius, use nearest
-        cand=[(idx,d0)]
-    cand.sort(key=lambda x:x[1])
-    if len(cand)>limit: cand=cand[:limit]
-    return cand
-
-def build_infra_graph(vertices, infra_edges):
-    topo_vertices=[Vertex.ByCoordinates(*v) for v in vertices]
+def build_graph(vertices_raw, edges_raw):
+    verts = [Vertex.ByCoordinates(*v) for v in vertices_raw]
     edge_objs=[]
-    for (i,j) in infra_edges:
-        v1=topo_vertices[i]; v2=topo_vertices[j]
+    for (i,j) in edges_raw:
+        v1=verts[i]; v2=verts[j]
+        length = dist3(vertices_raw[i], vertices_raw[j])
+        e = Edge.ByVertices(v1,v2)
+        d = Dictionary.ByKeysValues(["length"], [length])  # ONLY the 'length' key
+        try: e.SetDictionary(d)
+        except: pass
+        edge_objs.append(e)
+    topo = Cluster.ByTopologies(*edge_objs)
+    if SELF_MERGE:
+        topo = Topology.SelfMerge(topo, tolerance=TOLERANCE)
+    graph = Graph.ByTopology(topo, tolerance=TOLERANCE)
+    gverts = Graph.Vertices(graph)
+    gcoords = [v.Coordinates() for v in gverts]
+    return graph, gverts, gcoords
+
+def expand_wire_edge_sequence(wire):
+    """Return (coords_list, sum_length_from_edge_dicts) using the 'length' key."""
+    if not wire:
+        return [], None
+    try:
+        edges = Wire.Edges(wire)
+    except:
+        edges = []
+    if not edges:
+        # fallback: vertices only
         try:
-            e=Edge.ByVertices(v1,v2)
-            edge_objs.append(e)
+            vs = Wire.Vertices(wire)
+            coords = [v.Coordinates() for v in vs]
+            length = sum(dist3(coords[i], coords[i+1]) for i in range(len(coords)-1))
+            return coords, length
+        except:
+            return [], None
+    coords=[]
+    total=0.0
+    for e in edges:
+        try:
+            evs = Edge.Vertices(e)
+        except:
+            evs=[]
+        if len(evs)<2:
+            continue
+        c0=evs[0].Coordinates(); c1=evs[-1].Coordinates()
+        if not coords:
+            coords.append(c0)
+        elif coords[-1]!=c0:
+            coords.append(c0)
+        coords.append(c1)
+        # Dictionary length
+        length_val=None
+        try:
+            dct=e.Dictionary()
+            if dct:
+                keys=dct.Keys(); vals=dct.Values()
+                if "length" in keys:
+                    length_val = vals[keys.index("length")]
         except:
             pass
-    cluster=Cluster.ByTopologies(*edge_objs)
-    merged=Topology.SelfMerge(cluster,tolerance=INFRA_TOLERANCE)
-    graph=Graph.ByTopology(merged,tolerance=INFRA_TOLERANCE)
-    graph_vertices=Graph.Vertices(graph)
-    coords=[gv.Coordinates() for gv in graph_vertices]
-    return graph, graph_vertices, coords
-
-def wire_length_and_coords(wire, strict=True):
-    if not wire:
-        return None, []
-    if strict:
-        # Use edges so we sum true segment lengths
-        try:
-            edges=Wire.Edges(wire)
-        except:
-            edges=[]
-        if edges:
-            coords=[]
-            total=0.0
-            for e in edges:
-                try:
-                    ev=Edge.Vertices(e)
-                except:
-                    ev=[]
-                if len(ev)<2: continue
-                c0=ev[0].Coordinates(); c1=ev[-1].Coordinates()
-                if not coords:
-                    coords.append(c0)
-                elif coords[-1]!=c0:
-                    coords.append(c0)
-                coords.append(c1)
-                total+=dist3(c0,c1)
-            # Deduplicate consecutives
-            clean=[]
-            for c in coords:
-                if not clean or clean[-1]!=c:
-                    clean.append(c)
-            return total, clean
-    # Fallback simplified
-    try:
-        vs=Wire.Vertices(wire)
-        coords=[v.Coordinates() for v in vs]
-        total=sum(dist3(coords[i],coords[i+1]) for i in range(len(coords)-1))
-        return total, coords
-    except:
-        return None, []
-
-def shortest_path(graph, gv_start, gv_end):
-    try:
-        return Graph.ShortestPath(graph, gv_start, gv_end, tolerance=INFRA_TOLERANCE)
-    except:
-        return None
+        if length_val is None:
+            # fallback geometric
+            length_val = dist3(c0,c1)
+        total += length_val
+    # Deduplicate consecutives
+    clean=[]
+    for c in coords:
+        if not clean or clean[-1]!=c:
+            clean.append(c)
+    return clean,total
 
 def main():
     t0=time.time()
     script_dir=os.path.dirname(os.path.abspath(__file__))
     json_path=os.path.join(script_dir,"topologic.JSON")
     if not os.path.isfile(json_path):
-        log("ERROR missing topologic.JSON"); sys.exit(1)
-    data=json.load(open(json_path,"r"))
-
-    vertices=data.get("vertices",[])
-    infra_edges=data.get("infra_edges",[])
-    device_edges=data.get("device_edges",[])  # not used interior
-    starts=data.get("start_points",[])
-    end_pt=data.get("end_point",None)
-
-    log("Input: vertices={} infra_edges={} device_edges={} starts={}".format(
-        len(vertices), len(infra_edges), len(device_edges), len(starts)
-    ))
-
-    if not vertices or not infra_edges or len(starts)<2:
-        log("ERROR need at least 2 start points and infra graph.")
+        log("ERROR: topologic.JSON not found.")
         sys.exit(1)
 
-    graph, gverts, gcoords = build_infra_graph(vertices, infra_edges)
-    log("Infra graph vertices: {}".format(len(gcoords)))
+    data=json.load(open(json_path,"r"))
+    vertices = data.get("vertices",[])
+    combined  = data.get("edges",[])
+    starts    = data.get("start_points",[])
+    end_pt    = data.get("end_point",None)
 
-    # Map device start points to candidate infra vertices
-    device_chain = starts[:]  # preserve order
+    if not vertices or not combined:
+        log("ERROR: vertices or edges missing.")
+        sys.exit(1)
+
+    if len(starts)<2 and not end_pt:
+        log("ERROR: Need at least 2 start points or end point for a leg.")
+        sys.exit(1)
+
+    log("Vertices:{} Edges:{} Starts:{} EndPoint:{}".format(
+        len(vertices), len(combined), len(starts),
+        "Yes" if isinstance(end_pt,list) and len(end_pt)==3 else "No"
+    ))
+
+    graph, gverts, gcoords = build_graph(vertices, combined)
+    log("Graph vertices after build (SELF_MERGE={}): {}".format(SELF_MERGE, len(gcoords)))
+
+    # Build chain device list: start points in order + end
+    chain_devices = starts[:]
     if isinstance(end_pt,list) and len(end_pt)==3:
-        device_chain = device_chain + [{"element_id": None, "point": end_pt}]
-    else:
-        log("WARN no end point; chain ends with last start.")
-
-    # Precompute candidate lists per device
-    device_candidates=[]
-    for idx, sp in enumerate(device_chain):
-        coord=sp.get("point")
-        eid=sp.get("element_id")
-        if not (isinstance(coord,list) and len(coord)==3):
-            log("WARN invalid coord at chain index {}".format(idx))
-            device_candidates.append([])
-            continue
-        cand=find_candidates(coord, gcoords, CANDIDATE_SEARCH_RADIUS_FT,
-                             MAX_START_CANDIDATES if idx < len(device_chain)-1 else MAX_END_CANDIDATES)
-        # Always sort by distance
-        device_candidates.append(cand)
-        if LOG_VERBOSE:
-            log("Device {} (eid={}): {} candidates".format(idx, eid, len(cand)), verbose=True)
+        chain_devices.append({"element_id": None, "point": end_pt})
 
     results=[]
     success=0
+    total_legs=len(chain_devices)-1
 
-    # Iterate through legs
-    for leg_index in range(len(device_chain)-1):
-        origin=device_chain[leg_index]
-        dest  =device_chain[leg_index+1]
-        origin_coord=origin["point"]; dest_coord=dest["point"]
-        origin_eid=origin["element_id"]
+    for i in range(total_legs):
+        A = chain_devices[i]
+        B = chain_devices[i+1]
+        A_pt = A.get("point")
+        B_pt = B.get("point")
+        A_id = A.get("element_id")
 
-        origin_cands=device_candidates[leg_index]
-        dest_cands  =device_candidates[leg_index+1]
+        # Map each to nearest graph vertex
+        ai, ad = nearest_vertex_index(A_pt, gcoords)
+        bi, bd = nearest_vertex_index(B_pt, gcoords)
 
-        best_len=None
-        best_wire=None
-        best_pair=None
-        best_coords=None
+        if ad>MAP_TOLERANCE:
+            log("WARN start element {} leg {} mapping distance {:.6f}".format(A_id, i, ad))
+        if bd>MAP_TOLERANCE and B.get("element_id") is not None:
+            log("WARN dest element {} leg {} mapping distance {:.6f}".format(B.get("element_id"), i, bd))
 
-        # Try all candidate pairs
-        for (oi, odist) in origin_cands:
-            gv_start=gverts[oi]
-            for (di, ddist) in dest_cands:
-                gv_end=gverts[di]
-                wire=shortest_path(graph, gv_start, gv_end)
-                if not wire:
-                    continue
-                wlen, wcoords = wire_length_and_coords(wire, strict=STRICT_INFRA_LENGTH)
-                if wlen is None:
-                    continue
-                total_leg_len=wlen  # (No local device->vertex segments unless SNAP_DEVICE_TO_VERTEX False)
-                # Add local offsets if not snapping:
-                if not SNAP_DEVICE_TO_VERTEX:
-                    total_leg_len += dist3(origin_coord, wcoords[0]) + dist3(wcoords[-1], dest_coord)
+        vA = gverts[ai]
+        vB = gverts[bi]
 
-                if (best_len is None) or (total_leg_len < best_len):
-                    best_len=total_leg_len
-                    best_wire=wire
-                    best_pair=(oi, di, odist, ddist)
-                    best_coords=wcoords
+        # Run Graph.ShortestPath using edgeKey='length'
+        wire=None
+        try:
+            wire = Graph.ShortestPath(graph, vA, vB, edgeKey="length", tolerance=TOLERANCE)
+        except Exception as ex:
+            log("ERROR Graph.ShortestPath leg {}: {}".format(i, ex))
+            wire=None
 
-        if best_len is None:
-            log("WARN leg {} (eid {}) no path found among candidates".format(leg_index, origin_eid))
+        if not wire:
             results.append({
-                "start_index": leg_index,
-                "element_id": origin_eid,
+                "start_index": i,
+                "element_id": A_id,
                 "length": None,
                 "vertex_path_xyz": [],
-                "mapped_start_candidates": len(origin_cands),
-                "mapped_end_candidates": len(dest_cands)
+                "start_map_distance": ad,
+                "end_map_distance": bd
             })
             continue
 
-        # Build output coordinate path
-        if OUTPUT_ONLY_DEVICE_AND_END:
-            if SNAP_DEVICE_TO_VERTEX:
-                # Snap to start/end of chosen graph path
-                start_snap = best_coords[0]
-                end_snap   = best_coords[-1]
-                path_xyz=[list(start_snap), list(end_snap)]
-            else:
-                path_xyz=[origin_coord, dest_coord]
-        else:
-            # Full infra path
-            path_xyz=[]
-            if SNAP_DEVICE_TO_VERTEX:
-                # Use origin snapped to first infra coord
-                path_xyz.append(list(best_coords[0]))
-            else:
-                path_xyz.append(origin_coord)
-                # ensure not duplicating
-                if best_coords and origin_coord!=best_coords[0]:
-                    path_xyz.append(list(best_coords[0]))
-            # interior
-            for c in best_coords[1:-1]:
-                path_xyz.append(list(c))
-            # destination
-            if SNAP_DEVICE_TO_VERTEX:
-                path_xyz.append(list(best_coords[-1]))
-            else:
-                if best_coords and dest_coord!=best_coords[-1]:
-                    path_xyz.append(list(best_coords[-1]))
-                path_xyz.append(dest_coord)
+        path_coords, path_len = expand_wire_edge_sequence(wire)
 
-        if LOG_VERBOSE:
-            oi, di, od, dd = best_pair
-            log("Leg {} eid {}: chosen startV={} endV={} infraLen={:.6f} totalLen={:.6f} startMapDist={:.4f} endMapDist={:.4f}"
-                .format(leg_index, origin_eid, oi, di, best_len if SNAP_DEVICE_TO_VERTEX else best_len - (dist3(origin_coord,best_coords[0])+dist3(best_coords[-1],dest_coord)),
-                        best_len, od, dd), verbose=True)
+        # If requested, include original device coords at ends (even if not identical to snapped graph verts)
+        if INCLUDE_DEVICE_COORDS and path_coords:
+            # Replace first & last with original device coordinates for reference
+            path_coords[0] = tuple(A_pt)
+            path_coords[-1]= tuple(B_pt)
 
         results.append({
-            "start_index": leg_index,
-            "element_id": origin_eid,
-            "length": best_len,
-            "vertex_path_xyz": path_xyz,
-            "mapped_start_candidates": len(origin_cands),
-            "mapped_end_candidates": len(dest_cands),
-            "chosen_start_vertex_index": best_pair[0],
-            "chosen_end_vertex_index": best_pair[1],
-            "start_map_distance": best_pair[2],
-            "end_map_distance": best_pair[3],
-            "snapped": SNAP_DEVICE_TO_VERTEX,
-            "output_only_devices": OUTPUT_ONLY_DEVICE_AND_END
+            "start_index": i,
+            "element_id": A_id,
+            "length": path_len,
+            "vertex_path_xyz": [list(c) for c in path_coords],
+            "start_map_distance": ad,
+            "end_map_distance": bd
         })
-        success+=1
+        if path_len is not None:
+            success+=1
 
-    out={
+    out = {
         "meta":{
             "version": VERSION,
-            "infra_tolerance": INFRA_TOLERANCE,
+            "tolerance_used": TOLERANCE,
+            "self_merge": SELF_MERGE,
             "map_tolerance": MAP_TOLERANCE,
-            "candidate_radius": CANDIDATE_SEARCH_RADIUS_FT,
-            "max_start_candidates": MAX_START_CANDIDATES,
-            "max_end_candidates": MAX_END_CANDIDATES,
-            "snap_device_to_vertex": SNAP_DEVICE_TO_VERTEX,
-            "output_only_device_and_end": OUTPUT_ONLY_DEVICE_AND_END,
-            "strict_infra_length": STRICT_INFRA_LENGTH,
+            "include_device_coords": INCLUDE_DEVICE_COORDS,
             "vertices_input": len(vertices),
-            "infra_edges": len(infra_edges),
-            "device_edges": len(device_edges),
+            "edges_input": len(combined),
             "graph_vertices": len(gcoords),
             "start_points": len(starts),
-            "chain_points": len(device_chain),
-            "legs_total": len(results),
+            "chain_points": len(chain_devices),
+            "legs_total": total_legs,
             "paths_success": success,
-            "paths_failed": len(results)-success,
+            "paths_failed": total_legs-success,
             "duration_sec": time.time()-t0
         },
         "results": results
@@ -316,8 +244,9 @@ def main():
     out_path=os.path.join(script_dir,"topologic_results.json")
     with open(out_path,"w") as f:
         json.dump(out,f,indent=2)
+
     log("Results written: {}".format(out_path))
-    log("Summary: {} success / {} legs".format(success, len(results)))
+    log("Summary: {} success / {} legs".format(success,total_legs))
 
 if __name__ == "__main__":
     main()
