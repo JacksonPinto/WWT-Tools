@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 # Export Infrastructure + Projected L Jumpers (Edge Splitting)
-# Version: 3.0.0 (IronPython/Revit 2022+ and 2026 tested)
-#
-# (Unchanged header text omitted for brevity)
+# Version: 3.x (integrated calc_shortest_topologic launcher)
+
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, UV,
-    FamilyInstance, LocationCurve, FamilySymbol, BuiltInParameter
+    FamilyInstance, LocationCurve, BuiltInParameter
 )
 from Autodesk.Revit.UI.Selection import ObjectType
 from pyrevit import forms
-import os, json, math, traceback, datetime
+import os, json, math, traceback, datetime, sys
 
 # ---------------- CONFIG ----------------
 SHOW_SCRIPT_PATH = False
@@ -17,28 +16,56 @@ SHOW_SCRIPT_PATH = False
 USE_INFRA_CATEGORY_DIALOG  = True
 USE_DEVICE_CATEGORY_DIALOG = True
 
-# Geometry sampling & tolerances
 SUBDIVIDE_ARCS = True
 CURVE_SEG_LENGTH_FT = 0.25
 MERGE_TOL = 1e-6
 PROJECTION_ENDPOINT_TOL = 1e-4
 ROUND_PREC = 9
 
-# Fittings
 FITTING_CONNECTOR_TO_POINT = True
 INCLUDE_FITTING_WITHOUT_CONNECTORS = True
 
-# L jumper segment creation
 CREATE_VERTICAL_SEGMENT = True
 CREATE_HORIZONTAL_SEGMENT = True
 VERTICAL_MIN_LEN = 1e-4
 
-# External processing
-PYTHON3_PATH = r"C:\Users\JacksonAugusto\AppData\Local\Programs\Python\Python312\python.exe"
+# ---------------- External processing (PATCH) ----------------
+# Auto-detect a Python 3 interpreter so script works for any user profile.
+def _detect_python3():
+    # Environment override first
+    env_override = os.environ.get("CUSTOM_PYTHON3")
+    if env_override and os.path.isfile(env_override):
+        return env_override
+    home = os.path.expanduser("~")
+    local_appdata = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    candidates = []
+    # Typical user-local installs
+    for ver in ("Python312","Python311","Python310","Python39","Python38"):
+        candidates.append(os.path.join(local_appdata, "Programs", "Python", ver, "python.exe"))
+    # Program Files installations
+    pf = os.environ.get("ProgramFiles")
+    if pf:
+        for ver in ("Python312","Python311","Python310","Python39","Python38"):
+            candidates.append(os.path.join(pf, ver, "python.exe"))
+            candidates.append(os.path.join(pf, "Python", ver, "python.exe"))
+    # Fallback to sys.executable if looks like python 3
+    if sys.executable.lower().endswith("python.exe"):
+        candidates.append(sys.executable)
+    for c in candidates:
+        try:
+            if c and os.path.isfile(c):
+                return c
+        except:
+            pass
+    return ""  # empty => internal fallback only
+
+PYTHON3_PATH = _detect_python3()
+
 RUN_CALC_SHORTEST = True
-CALC_SCRIPT_NAME  = "calc_shortest.py"
-CALC_ARGS         = []
-FORCE_INTERNAL_CALC   = False
+# We now always use the integrated script
+CALC_SCRIPT_NAME  = "calc_shortest_topologic.py"
+CALC_ARGS         = []  # will be filled with --direct or --chain based on user mode
+FORCE_INTERNAL_CALC   = False  # keep False so external preferred when found
 
 RUN_UPDATE_LENGTHS = True
 UPDATE_SCRIPT_NAME = "update_cable_lengths.py"
@@ -48,15 +75,12 @@ FORCE_INTERNAL_UPDATE = True
 FALLBACK_INTERNAL_IF_EXTERNAL_FAILS = True
 OPEN_FOLDER_AFTER = False
 
-# Debug / console
 PRINT_TO_CONSOLE = True
 DEBUG_PROJECTION = False
 DEBUG_DEVICE     = False
 
-# --- NEW FLAG: enforce strict sequential manual picking (one-by-one) ---
-STRICT_MANUAL_SEQUENCE = True  # Set to False to revert to original multi-pick behavior
+STRICT_MANUAL_SEQUENCE = True
 
-# ----------------------------------------
 uidoc = __revit__.ActiveUIDocument
 doc   = uidoc.Document
 active_view = uidoc.ActiveView
@@ -65,20 +89,15 @@ if not doc or not active_view:
 
 def cprint(*args):
     if PRINT_TO_CONSOLE:
-        try:
-            print("[EXPORT]", " ".join([str(a) for a in args]))
-        except:
-            pass
+        try: print("[EXPORT]", " ".join([str(a) for a in args]))
+        except: pass
 
 def to_int_id(obj):
     try:
-        if hasattr(obj,'Id'):
-            return int(str(obj.Id))
-        if hasattr(obj,'IntegerValue'):
-            return obj.IntegerValue
+        if hasattr(obj,'Id'): return int(str(obj.Id))
+        if hasattr(obj,'IntegerValue'): return obj.IntegerValue
         return int(obj)
-    except:
-        return None
+    except: return None
 
 def dist3(a,b):
     return math.sqrt((a[0]-b[0])**2+(a[1]-b[1])**2+(a[2]-b[2])**2)
@@ -92,11 +111,9 @@ def sample_curve(curve):
         if (("line" in name) and ("arc" not in name)) or not SUBDIVIDE_ARCS:
             return [(sp.X,sp.Y,sp.Z),(ep.X,ep.Y,ep.Z)]
         segs=max(2,int(math.ceil(length/CURVE_SEG_LENGTH_FT)))
-        i=0
-        while i<=segs:
+        for i in range(segs+1):
             p=curve.Evaluate(float(i)/segs,True)
             pts.append((p.X,p.Y,p.Z))
-            i+=1
         return pts
     except:
         return pts
@@ -127,8 +144,7 @@ def get_all_connectors(el):
 def get_fitting_location_point(el):
     loc=getattr(el,"Location",None)
     if loc and hasattr(loc,"Point") and getattr(loc,"Point",None):
-        p=loc.Point
-        return (p.X,p.Y,p.Z),"LocationPoint"
+        p=loc.Point; return (p.X,p.Y,p.Z),"LocationPoint"
     try:
         if isinstance(el,FamilyInstance):
             tr=el.GetTransform()
@@ -151,12 +167,10 @@ def project_point_to_segment(pt, a, b):
     return (cx,cy,cz), t, d
 
 def get_symbol_name(symbol):
-    try:
-        return symbol.Name
+    try: return symbol.Name
     except:
         param = symbol.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
-        if param:
-            return param.AsString()
+        if param: return param.AsString()
     return "Unknown"
 
 infra_category_map=[
@@ -246,104 +260,79 @@ for cat in infra_cats:
 
 devices=[]
 
-# ---------------- PATCH: Strict sequential manual picking ----------------
+# Sequential manual pick
 if selection_mode == "manual":
     if STRICT_MANUAL_SEQUENCE:
-        forms.alert("Sequential Manual Pick: Click devices in desired order. Press ESC when done.")
-        seq = 0
-        seen_ids = set()
+        forms.alert("Sequential Manual Pick: Click devices in desired order. ESC to finish.")
+        seq=0; seen=set()
         while True:
             try:
-                ref = uidoc.Selection.PickObject(ObjectType.Element, "Pick device #{0} (ESC to finish)".format(seq+1))
-                el = doc.GetElement(ref.ElementId)
-                if selected_type_ids is not None and el.GetTypeId() not in selected_type_ids:
-                    cprint("Skipped (type filter) ElementId", to_int_id(el))
+                ref=uidoc.Selection.PickObject(ObjectType.Element, "Pick device #{}".format(seq+1))
+                el=doc.GetElement(ref.ElementId)
+                if selected_type_ids and el.GetTypeId() not in selected_type_ids:
                     continue
-                eid = to_int_id(el)
-                if eid in seen_ids:
-                    cprint("Duplicate pick ignored ElementId", eid)
-                    continue
-                devices.append(el)
-                seen_ids.add(eid)
-                cprint("Picked seq {0} ElementId {1}".format(seq, eid))
-                seq += 1
-            except:
-                break
+                eid=to_int_id(el)
+                if eid in seen: continue
+                devices.append(el); seen.add(eid); seq+=1
+            except: break
         if not devices:
             forms.alert("No devices picked.", exitscript=True)
     else:
-        # original multi-pick approach (unchanged)
         try:
             refs=uidoc.Selection.PickObjects(ObjectType.Element,"Pick device elements")
             for r in refs:
                 el=doc.GetElement(r.ElementId)
-                if selected_type_ids is not None:
-                    if el.GetTypeId() in selected_type_ids:
-                        devices.append(el)
-                else:
-                    devices.append(el)
+                if selected_type_ids and el.GetTypeId() not in selected_type_ids: continue
+                devices.append(el)
         except Exception as e:
-            forms.alert("Device pick aborted:\n{0}".format(e), exitscript=True)
-        if not devices:
-            forms.alert("No devices picked.", exitscript=True)
+            forms.alert("Device pick aborted:\n{}".format(e), exitscript=True)
+        if not devices: forms.alert("No devices picked.", exitscript=True)
 elif selection_mode == "all":
     for cid in device_cat_ids:
-        col = FilteredElementCollector(doc, active_view.Id).OfCategory(cid).WhereElementIsNotElementType()
-        for el in col:
-            devices.append(el)
+        col=FilteredElementCollector(doc, active_view.Id).OfCategory(cid).WhereElementIsNotElementType()
+        for el in col: devices.append(el)
 elif selection_mode == "bytype":
     try:
         for type_id in selected_type_ids:
-            col = FilteredElementCollector(doc, active_view.Id).OfTypeId(type_id).WhereElementIsNotElementType()
-            for el in col:
-                devices.append(el)
+            col=FilteredElementCollector(doc, active_view.Id).OfTypeId(type_id).WhereElementIsNotElementType()
+            for el in col: devices.append(el)
     except AttributeError:
         for cid in device_cat_ids:
-            col = FilteredElementCollector(doc, active_view.Id).OfCategory(cid).WhereElementIsNotElementType()
+            col=FilteredElementCollector(doc, active_view.Id).OfCategory(cid).WhereElementIsNotElementType()
             for el in col:
-                if el.GetTypeId() in selected_type_ids:
-                    devices.append(el)
-# --------------- END PATCH ----------------
+                if el.GetTypeId() in selected_type_ids: devices.append(el)
 
-cprint("Final device order (ElementIds):", [to_int_id(d) for d in devices])
+cprint("Final device order:", [to_int_id(d) for d in devices])
 
 vertices=[]
 vertex_map={}
 infra_edges=[]
-fitting_points=[]
 device_edges=[]
 start_points=[]
 
-calc_modes = [
+# Mode selection for calculation (PATCH: map to --direct / --chain)
+calc_modes=[
     "Individual Single Cable",
     "Daisy Chain Connection"
 ]
-user_mode = forms.SelectFromList.show(
-    calc_modes,
-    title="Modo de cálculo",
-    multiselect=False
-)
+user_mode = forms.SelectFromList.show(calc_modes, title="Calculation Mode", multiselect=False)
 if not user_mode:
-    forms.alert("Cálculo cancelado pelo usuário.", exitscript=True)
+    forms.alert("Calculation mode canceled.", exitscript=True)
 
+# Integrated script always used
+CALC_SCRIPT_NAME = "calc_shortest_topologic.py"
 if user_mode.startswith("Daisy"):
-    CALC_SCRIPT_NAME = "calc_shortest_chain.py"
+    CALC_ARGS = ["--chain"]
 else:
-    CALC_SCRIPT_NAME = "calc_shortest.py"
+    CALC_ARGS = ["--direct"]
 
 def add_vertex(pt):
     nk=norm_key(pt)
     idx=vertex_map.get(nk)
     if idx is not None: return idx
-    i=0
-    while i < len(vertices):
-        v=vertices[i]
-        if (abs(v[0]-pt[0])<=MERGE_TOL and
-            abs(v[1]-pt[1])<=MERGE_TOL and
-            abs(v[2]-pt[2])<=MERGE_TOL):
-            vertex_map[nk]=i
-            return i
-        i+=1
+    for i,v in enumerate(vertices):
+        if (abs(v[0]-pt[0])<=MERGE_TOL and abs(v[1]-pt[1])<=MERGE_TOL and abs(v[2]-pt[2])<=MERGE_TOL):
+            vertex_map[nk]=i; return i
     vertices.append([pt[0],pt[1],pt[2]])
     idx=len(vertices)-1
     vertex_map[nk]=idx
@@ -356,55 +345,42 @@ def add_edge(i,j,edge_list):
         if a==i and b==j: return
     edge_list.append([i,j])
 
-fittings_total=0
-fittings_lp_locationpoint=0
-fittings_lp_transform=0
-fittings_lp_none=0
+def get_symbol_loc(el):
+    loc=getattr(el,"Location",None)
+    if loc and hasattr(loc,"Point") and loc.Point:
+        p=loc.Point; return (p.X,p.Y,p.Z)
+    return None
 
+# Fittings
 for el in fittings:
-    fittings_total+=1
     lp, method = get_fitting_location_point(el)
-    if not lp:
-        fittings_lp_none+=1
-        continue
-    if method=="LocationPoint": fittings_lp_locationpoint+=1
-    elif method=="TransformOrigin": fittings_lp_transform+=1
-    fitting_points.append({
-        "element_id": to_int_id(el),
-        "method": method,
-        "point": [lp[0],lp[1],lp[2]]
-    })
+    if not lp: continue
+    base_idx=add_vertex(lp)
     cons=get_all_connectors(el)
     if cons:
-        base_idx=add_vertex(lp)
         for c in cons:
-            ci=add_vertex(c)
-            add_edge(ci, base_idx, infra_edges if FITTING_CONNECTOR_TO_POINT else infra_edges)
+            ci=add_vertex((c[0],c[1],c[2]))
+            add_edge(ci, base_idx, infra_edges)
     elif INCLUDE_FITTING_WITHOUT_CONNECTORS:
-        add_vertex(lp)
+        pass
 
-linear_total=0; linear_curve_edges=0
+# Linear elements
 for el in linears:
     loc=getattr(el,"Location",None)
     if not (loc and isinstance(loc,LocationCurve) and loc.Curve): continue
     pts=sample_curve(loc.Curve)
     if len(pts)<2: continue
-    linear_total+=1
     for a,b in zip(pts, pts[1:]):
         if dist3(a,b)>1e-9:
             ia=add_vertex(a); ib=add_vertex(b)
             add_edge(ia,ib,infra_edges)
-            linear_curve_edges+=1
 
-device_points=[]
-for d in devices:
-    loc=getattr(d,"Location",None)
-    if loc and hasattr(loc,"Point") and loc.Point:
-        p=loc.Point
-        device_points.append((d,(p.X,p.Y,p.Z)))
-
-if not device_points:
-    forms.alert("No device point locations found.", exitscript=True)
+# Devices & start points
+for seq,(el) in enumerate(devices):
+    p=get_symbol_loc(el)
+    if not p: continue
+    add_vertex(p)
+    start_points.append({"element_id": to_int_id(el), "point":[p[0],p[1],p[2]], "seq_index": seq})
 
 forms.alert("Pick a FACE for End Point (sink)")
 try:
@@ -418,76 +394,70 @@ def face_center(ref):
     if not geom: return None
     try:
         bbox=geom.GetBoundingBox()
+        from Autodesk.Revit.DB import UV
         uv=UV((bbox.Min.U+bbox.Max.U)/2.0,(bbox.Min.V+bbox.Max.V)/2.0)
         xyz=geom.Evaluate(uv)
         return (xyz.X,xyz.Y,xyz.Z)
     except: return None
 
 end_xyz=face_center(face_ref)
-if not end_xyz:
-    forms.alert("Failed computing end point.", exitscript=True)
+if not end_xyz: forms.alert("Failed computing end point.", exitscript=True)
 end_idx=add_vertex(end_xyz)
 
-def split_edge(edge_index, proj_pt, infra_edges):
-    a,b = infra_edges[edge_index]
-    del infra_edges[edge_index]
-    p_idx = add_vertex(proj_pt)
-    add_edge(a, p_idx, infra_edges)
-    add_edge(p_idx, b, infra_edges)
+# Minimal device projection / jumper edges (reuse original simplified logic)
+def project_point_to_segment(pt, a, b):
+    ax,ay,az=a; bx,by,bz=b; px,py,pz=pt
+    ab=(bx-ax,by-ay,bz-az); ap=(px-ax,py-ay,pz-az)
+    ab2=ab[0]*ab[0]+ab[1]*ab[1]+ab[2]*ab[2]
+    if ab2==0: return a,0.0,dist3(pt,a)
+    t=(ap[0]*ab[0]+ap[1]*ab[1]+ap[2]*ab[2])/ab2
+    t=max(0,min(1,t))
+    cx=ax+ab[0]*t; cy=ay+ab[1]*t; cz=az+ab[2]*t
+    return (cx,cy,cz), t, dist3(pt,(cx,cy,cz))
+
+def split_edge(idx, proj_pt, edges_list):
+    a,b=edges_list[idx]
+    del edges_list[idx]
+    p_idx=add_vertex(proj_pt)
+    add_edge(a,p_idx,edges_list)
+    add_edge(p_idx,b,edges_list)
     return p_idx
 
 def project_device(device_pt):
-    best_edge_index=None
-    best_proj=None
-    best_t=None
-    best_dist=None
-    i=0
-    while i < len(infra_edges):
-        a_idx,b_idx = infra_edges[i]
+    best=None; best_proj=None; best_t=None; best_d=None
+    for i,(a_idx,b_idx) in enumerate(infra_edges):
         a=vertices[a_idx]; b=vertices[b_idx]
-        proj, t, d = project_point_to_segment(device_pt, a, b)
-        if best_dist is None or d < best_dist:
-            best_dist=d; best_edge_index=i; best_proj=proj; best_t=t
-        i+=1
-    return best_edge_index, best_proj, best_t, best_dist
+        proj,t,d=project_point_to_segment(device_pt,a,b)
+        if best_d is None or d<best_d:
+            best=i; best_proj=proj; best_t=t; best_d=d
+    return best, best_proj, best_t, best_d
 
-# Device processing with seq_index (unchanged from earlier patch)
-for seq_idx, (d,(dx,dy,dz)) in enumerate(device_points):
-    dev_id=to_int_id(d)
-    device_vertex_idx = add_vertex((dx,dy,dz))
-    start_points.append({"element_id": dev_id if dev_id is not None else -1,
-                         "point":[dx,dy,dz],
-                         "seq_index": seq_idx})
+for sp in start_points:
+    dx,dy,dz = sp["point"]
     edge_idx, proj_pt, t_val, pdist = project_device((dx,dy,dz))
-    if edge_idx is None:
-        continue
+    if edge_idx is None: continue
     a_idx,b_idx = infra_edges[edge_idx]
     a=vertices[a_idx]; b=vertices[b_idx]
-    if dist3(proj_pt,a) <= PROJECTION_ENDPOINT_TOL:
-        proj_vertex_idx = a_idx
-    elif dist3(proj_pt,b) <= PROJECTION_ENDPOINT_TOL:
-        proj_vertex_idx = b_idx
+    from_pt = (dx,dy,dz)
+    if dist3(proj_pt,a)<=PROJECTION_ENDPOINT_TOL:
+        pj=a_idx
+    elif dist3(proj_pt,b)<=PROJECTION_ENDPOINT_TOL:
+        pj=b_idx
     else:
-        proj_vertex_idx = split_edge(edge_idx, proj_pt, infra_edges)
-        if DEBUG_PROJECTION:
-            cprint("Split edge; new vertex", proj_vertex_idx)
+        pj=split_edge(edge_idx, proj_pt, infra_edges)
+    # vertical + horizontal (device_edges)
     if CREATE_VERTICAL_SEGMENT:
-        v_pt = (dx,dy,vertices[proj_vertex_idx][2])
-        if abs(v_pt[2]-dz) <= VERTICAL_MIN_LEN:
-            vertical_idx = device_vertex_idx
+        v_pt=(dx,dy,vertices[pj][2])
+        if abs(v_pt[2]-dz)<=VERTICAL_MIN_LEN:
+            v_idx=add_vertex(from_pt)
         else:
-            vertical_idx = add_vertex(v_pt)
-            add_edge(device_vertex_idx, vertical_idx, device_edges)
-        if CREATE_HORIZONTAL_SEGMENT:
-            add_edge(vertical_idx, proj_vertex_idx, device_edges)
-        else:
-            if vertical_idx != proj_vertex_idx:
-                add_edge(vertical_idx, proj_vertex_idx, device_edges)
+            v_idx=add_vertex(v_pt)
+            add_edge(add_vertex(from_pt), v_idx, device_edges)
+        add_edge(v_idx, pj, device_edges)
     else:
-        add_edge(device_vertex_idx, proj_vertex_idx, device_edges)
+        add_edge(add_vertex(from_pt), pj, device_edges)
 
-cprint("Manual pick sequence (seq_index -> element_id):",
-       ["{}->{}".format(sp["seq_index"], sp["element_id"]) for sp in start_points])
+combined_edges = infra_edges + device_edges
 
 meta={
     "version":"3.0.0",
@@ -500,8 +470,6 @@ meta={
     "vertical_segment":CREATE_VERTICAL_SEGMENT,
     "horizontal_segment":CREATE_HORIZONTAL_SEGMENT
 }
-
-combined_edges = infra_edges + device_edges
 
 graph_data={
     "meta":meta,
@@ -518,24 +486,23 @@ json_path=os.path.join(script_dir,"topologic.JSON")
 with open(json_path,"w") as f:
     json.dump(graph_data,f,indent=2)
 
-cprint("EXPORT SUMMARY vertices={0} infraEdges={1} deviceEdges={2} totalEdges={3} devices={4}".format(
+cprint("EXPORT SUMMARY vertices={} infraEdges={} deviceEdges={} totalEdges={} devices={}".format(
     len(vertices), len(infra_edges), len(device_edges), len(combined_edges), len(start_points)
 ))
 
 forms.alert(
-    "GRAPH DONE\nVertices:{0}\nInfraEdges:{1}\nDeviceEdges:{2}\nTotalEdges:{3}\nDevices:{4}\nJSON:\n{5}".format(
-        len(vertices), len(infra_edges), len(device_edges), len(combined_edges), len(start_points), json_path
+    "GRAPH DONE\nVertices:{0}\nInfraEdges:{1}\nDeviceEdges:{2}\nTotalEdges:{3}\nDevices:{4}\nMode: {5}\nPython3: {6}\nJSON:\n{7}".format(
+        len(vertices), len(infra_edges), len(device_edges), len(combined_edges), len(start_points),
+        CALC_ARGS[0] if CALC_ARGS else "N/A", (PYTHON3_PATH or "Internal Only"), json_path
     ),
     title="Cable Length Calculation"
 )
 
-import subprocess
+import subprocess, traceback, datetime
+
 def run_external_or_internal(script_path, interpreter, args, allow_fallback, force_internal, log_basename,
                              injected_globals=None):
-    import subprocess
-    external_ok=False
-    stdout_data=""; stderr_data=""
-    status=""
+    external_ok=False; stdout_data=""; stderr_data=""; status=""
     log_path=os.path.join(os.path.dirname(script_path), log_basename)
     if (not force_internal) and interpreter and os.path.isfile(interpreter):
         try:
@@ -546,15 +513,12 @@ def run_external_or_internal(script_path, interpreter, args, allow_fallback, for
             out,err=proc.communicate()
             stdout_data, stderr_data = out, err
             rc=proc.returncode
-            if rc==0:
-                external_ok=True
-                status="External OK rc=0"
-            else:
-                status="External FAILED rc={0}".format(rc)
+            if rc==0: external_ok=True; status="External OK rc=0"
+            else: status="External FAILED rc={}".format(rc)
         except Exception as ex:
-            status="External exception: {0}".format(ex)
+            status="External exception: {}".format(ex)
     elif not force_internal:
-        status="External interpreter invalid: {0}".format(interpreter)
+        status="External interpreter invalid: {}".format(interpreter)
 
     if (force_internal or (not external_ok and allow_fallback)):
         try:
@@ -562,26 +526,27 @@ def run_external_or_internal(script_path, interpreter, args, allow_fallback, for
             if injected_globals: g.update(injected_globals)
             g['__file__']=script_path; g['__name__']='__main__'
             code=open(script_path,'r').read()
-            exec(compile(code, script_path, 'exec'), g, g)
-            if external_ok: status += "\nInternal EXEC SUCCESS."
-            else: status += "\nInternal fallback SUCCESS."
+            # Insert argv simulation for internal execution
+            old_argv=sys.argv
+            sys.argv=[script_path]+list(args)
+            try:
+                exec(compile(code, script_path, 'exec'), g, g)
+            finally:
+                sys.argv=old_argv
+            status += ("\nInternal EXEC SUCCESS." if external_ok else "\nInternal fallback SUCCESS.")
         except Exception as ie:
             tb=traceback.format_exc()
-            status += "\nInternal EXEC FAILED: {0}".format(ie)
-            stderr_data += "\n[INTERNAL TRACEBACK]\n{0}".format(tb)
+            status += "\nInternal EXEC FAILED: {}".format(ie)
+            stderr_data += "\n[INTERNAL TRACEBACK]\n{}".format(tb)
 
     try:
-        lf=open(log_path,"a")
-        lf.write("\n=== {0} | {1} ===\n".format(os.path.basename(script_path),
-                                                datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        lf.write("STATUS: {0}\n".format(status))
-        if stdout_data:
-            lf.write("--- STDOUT ---\n"); lf.write(stdout_data); lf.write("\n")
-        if stderr_data:
-            lf.write("--- STDERR ---\n"); lf.write(stderr_data); lf.write("\n")
-        lf.close()
+        with open(log_path,"a") as lf:
+            lf.write("\n=== {} | {} ===\n".format(os.path.basename(script_path),
+                                                  datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            lf.write("STATUS: {}\n".format(status))
+            if stdout_data: lf.write("--- STDOUT ---\n{}\n".format(stdout_data))
+            if stderr_data: lf.write("--- STDERR ---\n{}\n".format(stderr_data))
     except: pass
-
     return status, external_ok, stdout_data[:1200], stderr_data[:1200], log_path
 
 injected_globals = {
@@ -592,23 +557,21 @@ injected_globals = {
 }
 
 def run_step(run_flag, script_name, force_internal, args_list, title):
-    if not run_flag:
-        return
+    if not run_flag: return
     spath=os.path.join(script_dir, script_name)
     if not os.path.isfile(spath):
-        forms.alert("{0} not found: {1}".format(title, spath)); return
+        forms.alert("{} not found: {}".format(title, spath)); return
     status, ext_ok, out_snip, err_snip, logpath = run_external_or_internal(
         spath, PYTHON3_PATH, args_list, FALLBACK_INTERNAL_IF_EXTERNAL_FAILS,
         force_internal, script_name + ".log",
         injected_globals=injected_globals
     )
-    forms.alert("{0} Step:\n{1}\n\nSTDOUT(first 600):\n{2}".format(title, status, out_snip[:600]),
-                title="{0} Result".format(script_name))
+    forms.alert("{} Step:\n{}\n\nSTDOUT(first 600):\n{}".format(title, status, out_snip[:600]),
+                title="{} Result".format(script_name))
 
 run_step(RUN_CALC_SHORTEST, CALC_SCRIPT_NAME, FORCE_INTERNAL_CALC, CALC_ARGS, "Shortest Path")
 run_step(RUN_UPDATE_LENGTHS, UPDATE_SCRIPT_NAME, FORCE_INTERNAL_UPDATE, UPDATE_ARGS, "Update Lengths")
 
 if OPEN_FOLDER_AFTER:
-    try:
-        subprocess.Popen(r'explorer /select,"{0}"'.format(json_path))
+    try: subprocess.Popen(r'explorer /select,"{0}"'.format(json_path))
     except: pass

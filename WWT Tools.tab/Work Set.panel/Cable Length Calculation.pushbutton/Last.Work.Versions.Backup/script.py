@@ -2,28 +2,7 @@
 # Export Infrastructure + Projected L Jumpers (Edge Splitting)
 # Version: 3.0.0 (IronPython/Revit 2022+ and 2026 tested)
 #
-# Features:
-#   * Builds infrastructure edges (tray/conduit) with curve subdivision (optional).
-#   * For each device start point:
-#       - Finds nearest infrastructure segment (edge).
-#       - Projects device XY(Z) onto that segment.
-#       - If projection falls in the middle of an edge (not near endpoints) splits the edge:
-#             (a,b) -> (a,p) + (p,b) inserting new projection vertex p.
-#       - Creates L connection:
-#             device -> vertical point (same XY as device, Z=projection Z) [optional]
-#             vertical point -> projection vertex [optional horizontal]
-#         Controlled by CREATE_VERTICAL_SEGMENT / CREATE_HORIZONTAL_SEGMENT.
-#   * Writes:
-#       vertices
-#       infra_edges
-#       device_edges
-#       edges (combined, deduped)
-#       start_points
-#       end_point
-#   * Calls calc_shortest.py then update_cable_lengths.py
-#
-# IronPython safe (no f-strings).
-#
+# (Unchanged header text omitted for brevity)
 from Autodesk.Revit.DB import (
     FilteredElementCollector, BuiltInCategory, UV,
     FamilyInstance, LocationCurve, FamilySymbol, BuiltInParameter
@@ -40,10 +19,10 @@ USE_DEVICE_CATEGORY_DIALOG = True
 
 # Geometry sampling & tolerances
 SUBDIVIDE_ARCS = True
-CURVE_SEG_LENGTH_FT = 2.0
-MERGE_TOL = 5e-4               # Vertex merge tolerance
-PROJECTION_ENDPOINT_TOL = 1e-3 # If projection this close to endpoint, reuse endpoint
-ROUND_PREC = 6
+CURVE_SEG_LENGTH_FT = 0.25
+MERGE_TOL = 1e-6
+PROJECTION_ENDPOINT_TOL = 1e-4
+ROUND_PREC = 9
 
 # Fittings
 FITTING_CONNECTOR_TO_POINT = True
@@ -51,8 +30,8 @@ INCLUDE_FITTING_WITHOUT_CONNECTORS = True
 
 # L jumper segment creation
 CREATE_VERTICAL_SEGMENT = True
-CREATE_HORIZONTAL_SEGMENT = True  # horizontal from vertical point to projection. If False device connects directly (vertical only)
-VERTICAL_MIN_LEN = 1e-6           # treat near zero vertical difference as zero
+CREATE_HORIZONTAL_SEGMENT = True
+VERTICAL_MIN_LEN = 1e-4
 
 # External processing
 PYTHON3_PATH = r"C:\Users\JacksonAugusto\AppData\Local\Programs\Python\Python312\python.exe"
@@ -64,7 +43,7 @@ FORCE_INTERNAL_CALC   = False
 RUN_UPDATE_LENGTHS = True
 UPDATE_SCRIPT_NAME = "update_cable_lengths.py"
 UPDATE_ARGS        = []
-FORCE_INTERNAL_UPDATE = True      # Revit API => internal exec
+FORCE_INTERNAL_UPDATE = True
 
 FALLBACK_INTERNAL_IF_EXTERNAL_FAILS = True
 OPEN_FOLDER_AFTER = False
@@ -73,6 +52,9 @@ OPEN_FOLDER_AFTER = False
 PRINT_TO_CONSOLE = True
 DEBUG_PROJECTION = False
 DEBUG_DEVICE     = False
+
+# --- NEW FLAG: enforce strict sequential manual picking (one-by-one) ---
+STRICT_MANUAL_SEQUENCE = True  # Set to False to revert to original multi-pick behavior
 
 # ----------------------------------------
 uidoc = __revit__.ActiveUIDocument
@@ -157,7 +139,6 @@ def get_fitting_location_point(el):
     return None,"None"
 
 def project_point_to_segment(pt, a, b):
-    # Returns (projection_point, t_clamped, distance)
     ax,ay,az = a; bx,by,bz = b; px,py,pz = pt
     ab=(bx-ax, by-ay, bz-az); ap=(px-ax, py-ay, pz-az)
     ab2=ab[0]*ab[0]+ab[1]*ab[1]+ab[2]*ab[2]
@@ -170,7 +151,6 @@ def project_point_to_segment(pt, a, b):
     return (cx,cy,cz), t, d
 
 def get_symbol_name(symbol):
-    """Safely get the name of a FamilySymbol."""
     try:
         return symbol.Name
     except:
@@ -179,7 +159,6 @@ def get_symbol_name(symbol):
             return param.AsString()
     return "Unknown"
 
-# --- Category selection ---
 infra_category_map=[
     ("Cable Trays", BuiltInCategory.OST_CableTray),
     ("Cable Tray Fittings", BuiltInCategory.OST_CableTrayFitting),
@@ -216,7 +195,6 @@ else:
     dchosen=[n for n,_ in device_category_map]
     device_cat_ids=[cid for _,cid in device_category_map]
 
-# --- Device selection mode with type filtering ---
 selection_modes = [
     "Manual Pick Devices",
     "All Devices In Active View",
@@ -233,10 +211,8 @@ selection_mode = (
 
 selected_type_ids = None
 if selection_mode == "bytype":
-    # Gather all device types (FamilySymbol) in active view for selected categories
     type_choices = []
     type_map = {}
-    # Collect all instances to get their typeIds
     for cid in device_cat_ids:
         col = FilteredElementCollector(doc, active_view.Id).OfCategory(cid).WhereElementIsNotElementType()
         for el in col:
@@ -246,7 +222,7 @@ if selection_mode == "bytype":
                 name = get_symbol_name(symbol)
                 cat_name = symbol.Category.Name if symbol.Category else str(cid)
                 pretty = "{} - {}".format(cat_name, name)
-                if pretty not in type_map:  # avoid duplicates
+                if pretty not in type_map:
                     type_choices.append(pretty)
                     type_map[pretty] = symbol_id
     if not type_choices:
@@ -258,7 +234,6 @@ if selection_mode == "bytype":
         forms.alert("No device types selected.", exitscript=True)
     selected_type_ids = [type_map[name] for name in selected_types]
 
-# --- Collect infrastructure ---
 fitting_cat_set=set([BuiltInCategory.OST_CableTrayFitting, BuiltInCategory.OST_ConduitFitting])
 linear_cat_set =set([BuiltInCategory.OST_CableTray, BuiltInCategory.OST_Conduit])
 
@@ -269,54 +244,97 @@ for cat in infra_cats:
         if cat in fitting_cat_set: fittings.append(el)
         elif cat in linear_cat_set: linears.append(el)
 
-# --- Device instance collection, now using OfTypeId (Revit 2022+) or fallback ---
 devices=[]
+
+# ---------------- PATCH: Strict sequential manual picking ----------------
 if selection_mode == "manual":
-    try:
-        refs=uidoc.Selection.PickObjects(ObjectType.Element,"Pick device elements")
-        for r in refs:
-            el=doc.GetElement(r.ElementId)
-            if selected_type_ids is not None:
-                if el.GetTypeId() in selected_type_ids:
-                    devices.append(el)
-            else:
+    if STRICT_MANUAL_SEQUENCE:
+        forms.alert("Sequential Manual Pick: Click devices in desired order. Press ESC when done.")
+        seq = 0
+        seen_ids = set()
+        while True:
+            try:
+                ref = uidoc.Selection.PickObject(ObjectType.Element, "Pick device #{0} (ESC to finish)".format(seq+1))
+                el = doc.GetElement(ref.ElementId)
+                if selected_type_ids is not None and el.GetTypeId() not in selected_type_ids:
+                    cprint("Skipped (type filter) ElementId", to_int_id(el))
+                    continue
+                eid = to_int_id(el)
+                if eid in seen_ids:
+                    cprint("Duplicate pick ignored ElementId", eid)
+                    continue
                 devices.append(el)
-    except Exception as e:
-        forms.alert("Device pick aborted:\n{0}".format(e), exitscript=True)
+                seen_ids.add(eid)
+                cprint("Picked seq {0} ElementId {1}".format(seq, eid))
+                seq += 1
+            except:
+                break
+        if not devices:
+            forms.alert("No devices picked.", exitscript=True)
+    else:
+        # original multi-pick approach (unchanged)
+        try:
+            refs=uidoc.Selection.PickObjects(ObjectType.Element,"Pick device elements")
+            for r in refs:
+                el=doc.GetElement(r.ElementId)
+                if selected_type_ids is not None:
+                    if el.GetTypeId() in selected_type_ids:
+                        devices.append(el)
+                else:
+                    devices.append(el)
+        except Exception as e:
+            forms.alert("Device pick aborted:\n{0}".format(e), exitscript=True)
+        if not devices:
+            forms.alert("No devices picked.", exitscript=True)
 elif selection_mode == "all":
     for cid in device_cat_ids:
         col = FilteredElementCollector(doc, active_view.Id).OfCategory(cid).WhereElementIsNotElementType()
         for el in col:
             devices.append(el)
 elif selection_mode == "bytype":
-    # Use OfTypeId for efficiency (Revit 2022+), fallback to python filter if not available
     try:
-        # Will raise AttributeError if OfTypeId is not available
         for type_id in selected_type_ids:
             col = FilteredElementCollector(doc, active_view.Id).OfTypeId(type_id).WhereElementIsNotElementType()
             for el in col:
                 devices.append(el)
     except AttributeError:
-        # Fallback: filter all elements by type id
         for cid in device_cat_ids:
             col = FilteredElementCollector(doc, active_view.Id).OfCategory(cid).WhereElementIsNotElementType()
             for el in col:
                 if el.GetTypeId() in selected_type_ids:
                     devices.append(el)
+# --------------- END PATCH ----------------
 
-vertices=[]            # list of [x,y,z]
-vertex_map={}          # norm_key -> index
-infra_edges=[]         # list of [i,j] (after splitting)
+cprint("Final device order (ElementIds):", [to_int_id(d) for d in devices])
+
+vertices=[]
+vertex_map={}
+infra_edges=[]
 fitting_points=[]
-device_edges=[]        # jumper edges (added after projection splitting)
+device_edges=[]
 start_points=[]
+
+calc_modes = [
+    "Individual Single Cable",
+    "Daisy Chain Connection"
+]
+user_mode = forms.SelectFromList.show(
+    calc_modes,
+    title="Modo de cálculo",
+    multiselect=False
+)
+if not user_mode:
+    forms.alert("Cálculo cancelado pelo usuário.", exitscript=True)
+
+if user_mode.startswith("Daisy"):
+    CALC_SCRIPT_NAME = "calc_shortest_chain.py"
+else:
+    CALC_SCRIPT_NAME = "calc_shortest.py"
 
 def add_vertex(pt):
     nk=norm_key(pt)
     idx=vertex_map.get(nk)
-    if idx is not None:
-        return idx
-    # search for near match (MERGE_TOL)
+    if idx is not None: return idx
     i=0
     while i < len(vertices):
         v=vertices[i]
@@ -334,13 +352,10 @@ def add_vertex(pt):
 def add_edge(i,j,edge_list):
     if i==j: return
     if i>j: i,j=j,i
-    # check duplicate
     for (a,b) in edge_list:
-        if a==i and b==j:
-            return
+        if a==i and b==j: return
     edge_list.append([i,j])
 
-# Fittings contribute their connectors as edges (like before)
 fittings_total=0
 fittings_lp_locationpoint=0
 fittings_lp_transform=0
@@ -366,10 +381,8 @@ for el in fittings:
             ci=add_vertex(c)
             add_edge(ci, base_idx, infra_edges if FITTING_CONNECTOR_TO_POINT else infra_edges)
     elif INCLUDE_FITTING_WITHOUT_CONNECTORS:
-        # just ensure vertex exists
         add_vertex(lp)
 
-# Linear infrastructure
 linear_total=0; linear_curve_edges=0
 for el in linears:
     loc=getattr(el,"Location",None)
@@ -383,7 +396,6 @@ for el in linears:
             add_edge(ia,ib,infra_edges)
             linear_curve_edges+=1
 
-# Devices
 device_points=[]
 for d in devices:
     loc=getattr(d,"Location",None)
@@ -394,7 +406,6 @@ for d in devices:
 if not device_points:
     forms.alert("No device point locations found.", exitscript=True)
 
-# END point selection
 forms.alert("Pick a FACE for End Point (sink)")
 try:
     face_ref=uidoc.Selection.PickObject(ObjectType.Face,"Pick End Face")
@@ -415,12 +426,10 @@ def face_center(ref):
 end_xyz=face_center(face_ref)
 if not end_xyz:
     forms.alert("Failed computing end point.", exitscript=True)
-end_idx=add_vertex(end_xyz)  # self-edge not needed; vertex ensures presence
+end_idx=add_vertex(end_xyz)
 
-# Build dynamic structure so we can split edges
 def split_edge(edge_index, proj_pt, infra_edges):
     a,b = infra_edges[edge_index]
-    # remove original
     del infra_edges[edge_index]
     p_idx = add_vertex(proj_pt)
     add_edge(a, p_idx, infra_edges)
@@ -432,7 +441,6 @@ def project_device(device_pt):
     best_proj=None
     best_t=None
     best_dist=None
-    # Iterate over infra_edges
     i=0
     while i < len(infra_edges):
         a_idx,b_idx = infra_edges[i]
@@ -443,46 +451,43 @@ def project_device(device_pt):
         i+=1
     return best_edge_index, best_proj, best_t, best_dist
 
-# Process devices
-for d,(dx,dy,dz) in device_points:
+# Device processing with seq_index (unchanged from earlier patch)
+for seq_idx, (d,(dx,dy,dz)) in enumerate(device_points):
     dev_id=to_int_id(d)
     device_vertex_idx = add_vertex((dx,dy,dz))
-    # record start point now (original device coordinate)
     start_points.append({"element_id": dev_id if dev_id is not None else -1,
-                         "point":[dx,dy,dz]})
+                         "point":[dx,dy,dz],
+                         "seq_index": seq_idx})
     edge_idx, proj_pt, t_val, pdist = project_device((dx,dy,dz))
     if edge_idx is None:
         continue
     a_idx,b_idx = infra_edges[edge_idx]
     a=vertices[a_idx]; b=vertices[b_idx]
-    # Check closeness to endpoints
     if dist3(proj_pt,a) <= PROJECTION_ENDPOINT_TOL:
         proj_vertex_idx = a_idx
     elif dist3(proj_pt,b) <= PROJECTION_ENDPOINT_TOL:
         proj_vertex_idx = b_idx
     else:
-        # interior split
         proj_vertex_idx = split_edge(edge_idx, proj_pt, infra_edges)
         if DEBUG_PROJECTION:
             cprint("Split edge; new vertex", proj_vertex_idx)
-    # Create L edges
-    # vertical intermediate
     if CREATE_VERTICAL_SEGMENT:
         v_pt = (dx,dy,vertices[proj_vertex_idx][2])
         if abs(v_pt[2]-dz) <= VERTICAL_MIN_LEN:
-            vertical_idx = device_vertex_idx  # no vertical needed
+            vertical_idx = device_vertex_idx
         else:
             vertical_idx = add_vertex(v_pt)
             add_edge(device_vertex_idx, vertical_idx, device_edges)
         if CREATE_HORIZONTAL_SEGMENT:
             add_edge(vertical_idx, proj_vertex_idx, device_edges)
         else:
-            # connect device (or vertical) directly if horizontal skipped
             if vertical_idx != proj_vertex_idx:
                 add_edge(vertical_idx, proj_vertex_idx, device_edges)
     else:
-        # direct diagonal to projection
         add_edge(device_vertex_idx, proj_vertex_idx, device_edges)
+
+cprint("Manual pick sequence (seq_index -> element_id):",
+       ["{}->{}".format(sp["seq_index"], sp["element_id"]) for sp in start_points])
 
 meta={
     "version":"3.0.0",
@@ -496,7 +501,6 @@ meta={
     "horizontal_segment":CREATE_HORIZONTAL_SEGMENT
 }
 
-# Combined edges list (infra first then device)
 combined_edges = infra_edges + device_edges
 
 graph_data={
@@ -525,9 +529,7 @@ forms.alert(
     title="Cable Length Calculation"
 )
 
-# ---------- External Runner ----------
 import subprocess
-
 def run_external_or_internal(script_path, interpreter, args, allow_fallback, force_internal, log_basename,
                              injected_globals=None):
     import subprocess
