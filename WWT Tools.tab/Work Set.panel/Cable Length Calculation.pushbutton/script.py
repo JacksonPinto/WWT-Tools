@@ -32,28 +32,51 @@ VERTICAL_MIN_LEN = 1e-4
 # ---------------- External processing (PATCH) ----------------
 # Auto-detect a Python 3 interpreter so script works for any user profile.
 def _detect_python3():
-    # Environment override first
-    env_override = os.environ.get("CUSTOM_PYTHON3")
-    if env_override and os.path.isfile(env_override):
-        return env_override
+    import sys, os
+    # 1. Environment variable override (CUSTOM_PYTHON3 or PYTHON3_PATH)
+    for env_var in ("CUSTOM_PYTHON3", "PYTHON3_PATH"):
+        env_override = os.environ.get(env_var)
+        if env_override and os.path.isfile(env_override):
+            return env_override
+
     home = os.path.expanduser("~")
     local_appdata = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
     candidates = []
-    # Typical user-local installs
+
+    # 2. Typical user-local installs
     for ver in ("Python312","Python311","Python310","Python39","Python38"):
         candidates.append(os.path.join(local_appdata, "Programs", "Python", ver, "python.exe"))
-    # Program Files installations
+
+    # 3. Program Files installs
     pf = os.environ.get("ProgramFiles")
     if pf:
         for ver in ("Python312","Python311","Python310","Python39","Python38"):
             candidates.append(os.path.join(pf, ver, "python.exe"))
             candidates.append(os.path.join(pf, "Python", ver, "python.exe"))
-    # Fallback to sys.executable if looks like python 3
-    if sys.executable.lower().endswith("python.exe"):
-        candidates.append(sys.executable)
+
+    # 4. sys.executable (exclude IronPython / None)
+    exe = getattr(sys, "executable", None)
+    if exe and isinstance(exe, basestring if 'basestring' in dir(__builtins__) else str):
+        lower = exe.lower()
+        if lower.endswith("python.exe") and ("ironpython" not in lower):
+            candidates.append(exe)
+
+    # 5. PATH search (very lightweight)
+    path_env = os.environ.get("PATH","")
+    for p in path_env.split(os.pathsep):
+        cand = os.path.join(p, "python.exe")
+        if os.path.isfile(cand):
+            candidates.append(cand)
+
+    # Deduplicate preserving order
+    seen=set(); ordered=[]
     for c in candidates:
+        if c and c not in seen:
+            seen.add(c); ordered.append(c)
+
+    for c in ordered:
         try:
-            if c and os.path.isfile(c):
+            if os.path.isfile(c):
                 return c
         except:
             pass
@@ -62,10 +85,9 @@ def _detect_python3():
 PYTHON3_PATH = _detect_python3()
 
 RUN_CALC_SHORTEST = True
-# We now always use the integrated script
 CALC_SCRIPT_NAME  = "calc_shortest_topologic.py"
-CALC_ARGS         = []  # will be filled with --direct or --chain based on user mode
-FORCE_INTERNAL_CALC   = False  # keep False so external preferred when found
+CALC_ARGS         = []  # will be set to --direct or --chain later
+FORCE_INTERNAL_CALC   = False
 
 RUN_UPDATE_LENGTHS = True
 UPDATE_SCRIPT_NAME = "update_cable_lengths.py"
