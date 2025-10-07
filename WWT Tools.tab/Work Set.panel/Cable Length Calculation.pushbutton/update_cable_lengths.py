@@ -85,8 +85,8 @@ skipped_missing = 0
 t = Transaction(doc, "Update Cable Lengths")
 t.Start()
 for res in results:
-    eid = res.get("element_id")
-    length = res.get("length")
+    eid = res.get("from_element_id")
+    length = res.get("raw_length")
     el = id_to_elem.get(eid)
     if not el:
         skipped_missing += 1
