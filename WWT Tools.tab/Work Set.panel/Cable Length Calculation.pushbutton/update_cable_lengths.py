@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 # update_cable_lengths.py
-# Version: 6.5.2 (2025-08-27)
+# Version: 6.6.0 (2025-10-07)
 # Author: JacksonPinto
 #
-# UPDATE 6.5.2:
-# - Adjusted reader for new results JSON structure (results list under 'results', includes meta).
-# - Verifies count of elements found vs results.
-# - Logs skipped elements (no path).
-# - Keeps existing behavior coloring Green (has length) / Red (no length).
+# UPDATE 6.6.0:
+# - Added support for unified Topologic results schema:
+#     { "meta": {...}, "sequence": { "legs": [ ... ] } }
+# - Still supports legacy "results" list or direct list formats.
+# - Selects length in priority: raw_length (if >0) else topologic_length (if status ok) else raw_length (even if 0) when raw_success True.
+# - Colors Green on path success (raw_success True or topologic_status == "ok"), Red otherwise.
+# - Safe handling of duplicate element IDs (keeps first non-zero length or longest).
+# - Added basic console logging for diagnostics (printed to pyRevit output).
 #
 from Autodesk.Revit.DB import FilteredElementCollector, Transaction
 from pyrevit import forms
@@ -23,13 +26,36 @@ if not os.path.exists(results_path):
 with open(results_path, "r") as f:
     data = json.load(f)
 
-# Backward compatibility: if 'results' not present assume full list
-if "results" in data:
-    results = data["results"]
+# ---------------------------
+# Normalize results collection
+# ---------------------------
+# Supported patterns:
+# 1) Unified: {"meta": {...}, "sequence": {"legs":[...]}}
+# 2) Prior direct: {"results":[...]}
+# 3) Legacy: [ {...}, {...} ]
+if isinstance(data, dict):
+    if "sequence" in data and isinstance(data["sequence"], dict) and "legs" in data["sequence"]:
+        results = data["sequence"]["legs"]
+    elif "results" in data and isinstance(data["results"], list):
+        results = data["results"]
+    else:
+        # Attempt direct list fallback
+        maybe_list = data.get("legs")
+        if isinstance(maybe_list, list):
+            results = maybe_list
+        else:
+            # Last resort: treat dict values that look like legs (not expected)
+            forms.alert("Unsupported JSON schema in topologic_results.json", exitscript=True)
 else:
-    results = data  # old format list
+    # Raw list
+    results = data
 
-# Collect categories in active view
+if not isinstance(results, list):
+    forms.alert("Parsed results are not a list. Abort.", exitscript=True)
+
+# ---------------------------
+# Collect categories in view
+# ---------------------------
 categories = set()
 for el in FilteredElementCollector(doc, doc.ActiveView.Id).WhereElementIsNotElementType():
     try:
@@ -52,7 +78,9 @@ elements = [
 if not elements:
     forms.alert("No elements of selected category in view.", exitscript=True)
 
-# Parameter selection
+# ---------------------------
+# Parameter selections
+# ---------------------------
 param_names = [p.Definition.Name for p in elements[0].Parameters]
 target_param = forms.SelectFromList.show(param_names, title="Select Parameter to store cable length", multiselect=False)
 if not target_param:
@@ -68,7 +96,9 @@ if color_param not in param_names:
         forms.alert("No color parameter chosen.", exitscript=True)
     color_param = picked if not isinstance(picked, list) else picked[0]
 
-# Map elements
+# ---------------------------
+# Map Revit elements by ID
+# ---------------------------
 id_to_elem = {}
 for el in elements:
     try:
@@ -76,7 +106,64 @@ for el in elements:
     except:
         pass
 
-# Apply
+# ---------------------------
+# Build element length map
+# Handle duplicates: keep first non-zero; else larger value
+# ---------------------------
+elem_lengths = {}       # element_id -> length (float)
+elem_success = {}       # element_id -> bool (success path flag)
+skipped_no_id = 0
+skipped_no_length = 0
+
+for res in results:
+    eid = res.get("from_element_id")
+    if eid is None:
+        skipped_no_id += 1
+        continue
+
+    raw_len = res.get("raw_length")
+    raw_success = res.get("raw_success")
+    topo_status = res.get("topologic_status")
+    topo_len = res.get("topologic_length")
+
+    # Determine success flag
+    success_flag = bool(raw_success) or (topo_status == "ok")
+
+    # Determine candidate length:
+    # Priority: positive raw_length >0 -> else positive topo_length -> else raw_length (even 0 if success) -> else None
+    length_val = None
+    if isinstance(raw_len, (int, float)) and raw_len > 0:
+        length_val = float(raw_len)
+    elif topo_status == "ok" and isinstance(topo_len, (int, float)) and topo_len > 0:
+        length_val = float(topo_len)
+    elif success_flag and isinstance(raw_len, (int, float)):
+        length_val = float(raw_len)
+
+    if length_val is None:
+        skipped_no_length += 1
+        # Still record success flag so color can reflect failure
+        if eid not in elem_success:
+            elem_success[eid] = False
+        continue
+
+    # Merge logic
+    if eid not in elem_lengths:
+        elem_lengths[eid] = length_val
+        elem_success[eid] = success_flag
+    else:
+        # Prefer existing non-zero; if existing zero and new >0 update; else keep larger
+        if elem_lengths[eid] == 0.0 and length_val > 0:
+            elem_lengths[eid] = length_val
+            elem_success[eid] = success_flag
+        else:
+            # Keep larger length if that seems more complete
+            if length_val > elem_lengths[eid]:
+                elem_lengths[eid] = length_val
+                elem_success[eid] = success_flag or elem_success[eid]
+
+# ---------------------------
+# Apply to Revit
+# ---------------------------
 updated = 0
 green = 0
 red = 0
@@ -84,27 +171,27 @@ skipped_missing = 0
 
 t = Transaction(doc, "Update Cable Lengths")
 t.Start()
-for res in results:
-    eid = res.get("from_element_id")
-    length = res.get("raw_length")
+for eid, length in elem_lengths.items():
     el = id_to_elem.get(eid)
     if not el:
         skipped_missing += 1
         continue
-    # set length
-    if length is not None:
-        p = el.LookupParameter(target_param)
-        if p:
-            try:
-                p.Set(length)  # values are in internal feet
-                updated += 1
-            except Exception as e:
-                print("[WARN] Could not set length for {}: {}".format(eid, e))
-    # set color
+
+    success_flag = elem_success.get(eid, False)
+    # Set length
+    p = el.LookupParameter(target_param)
+    if p:
+        try:
+            p.Set(length)
+            updated += 1
+        except Exception as e:
+            print("[WARN] Could not set length for {}: {}".format(eid, e))
+
+    # Color
     cp = el.LookupParameter(color_param)
     if cp:
         try:
-            if length is not None:
+            if success_flag:
                 cp.Set("Green")
                 green += 1
             else:
@@ -114,7 +201,39 @@ for res in results:
             print("[WARN] Could not set color for {}: {}".format(eid, e))
 t.Commit()
 
+# ---------------------------
+# Report
+# ---------------------------
 forms.alert(
-    "Update complete.\nCategory: {}\nLength Param: {}\nUpdated Lengths: {}\nGreen: {}  Red: {}\nSkipped (no element in view): {}\nTotal Results: {}"
-    .format(selected_cat, target_param, updated, green, red, skipped_missing, len(results))
+    "Cable Length Update Complete\n"
+    "Category: {}\n"
+    "Length Param: {}\n"
+    "Elements Updated: {}\n"
+    "Green: {}  Red: {}\n"
+    "Skipped (no element in view): {}\n"
+    "Skipped (no id in leg): {}\n"
+    "Skipped (no usable length): {}\n"
+    "Leg Records Processed: {}\n"
+    "Unique Element IDs with lengths: {}"
+    .format(
+        selected_cat,
+        target_param,
+        updated,
+        green,
+        red,
+        skipped_missing,
+        skipped_no_id,
+        skipped_no_length,
+        len(results),
+        len(elem_lengths)
+    )
 )
+
+# Console diagnostics (pyRevit output)
+print("[INFO] Results file:", results_path)
+print("[INFO] Legs processed:", len(results))
+print("[INFO] Unique element length assignments:", len(elem_lengths))
+print("[INFO] Updated elements:", updated)
+print("[INFO] Success (Green):", green, " Fail (Red):", red)
+print("[INFO] Skipped no element:", skipped_missing,
+      "no id:", skipped_no_id, "no length:", skipped_no_length)
