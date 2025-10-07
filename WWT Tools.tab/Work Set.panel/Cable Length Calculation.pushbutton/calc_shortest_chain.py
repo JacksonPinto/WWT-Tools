@@ -4,7 +4,7 @@ import math
 import time
 import sys
 from collections import deque, defaultdict
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple
 
 # ------------------------------------------------------------------
 # Configuration
@@ -12,31 +12,38 @@ from typing import List, Dict, Any, Tuple, Optional
 DEFAULT_JSON_INPUT_FILENAME = "topologic.JSON"
 JSON_OUTPUT_FILENAME = "topologic_results.json"
 
-TOLERANCE = 0.000001          # Very small to avoid unintended merges
-SNAP_TOLERANCE = 1e-9         # Exact coordinate match requirement
-EDGE_WEIGHT_KEY = "w"         # Edge cost dictionary key
-USE_TOPOLOGIC = True          # Use Topologic.Graph in comparison
-USE_EDGE_WEIGHTS = True       # Store geometric length in edge dictionaries
-RAW_USE_WEIGHTS = True        # Dijkstra weighted by geometric length
-REQUIRE_MATCH = False         # If True, discard Topologic path if deviates from raw
+TOLERANCE = 1e-6
+SNAP_TOLERANCE = 1e-9
+
+PREFER_INFRA_EDGES = True
+RAW_WEIGHTED = True
+USE_TOPOLOGIC = True
+USE_EDGE_WEIGHTS = True
+EDGE_WEIGHT_KEY = "w"
+REQUIRE_MATCH = False
 EXPORT_GRAPH_JSON = False
 GRAPH_EXPORT_FILENAME = "topologic_script.json"
 OVERWRITE_GRAPH_EXPORT = True
+INCLUDE_END_POINT_VERTEX = True
+
+# Fallback flags
+ENABLE_VERTICAL_BRIDGING_FALLBACK = True          # Existing vertical bridging
+BRIDGING_XY_TOL = 1e-6
+BRIDGING_ALLOW_ALL_LEGS = False
+ENABLE_FINAL_STUB_FALLBACK = True                 # New: create synthetic path to end if unreachable
+STUB_SENTINEL_EDGE_ID = -999                      # Edge id marker for stub tail segment
 
 DEBUG = ("--debug" in sys.argv) or (os.environ.get("DEBUG") == "1")
-def dprint(*a): 
+def dprint(*a):
     if DEBUG: print("[DEBUG]", *a)
 
-# ------------------------------------------------------------------
-# Load JSON
-# ------------------------------------------------------------------
 def load_json(path: str) -> Dict[str, Any]:
     with open(path, "r") as f:
         return json.load(f)
 
-# ------------------------------------------------------------------
-# Raw Graph (exact indices)
-# ------------------------------------------------------------------
+def euclid(a, b): return math.dist(a, b)
+def same_coord(a, b, tol): return abs(a[0]-b[0])<=tol and abs(a[1]-b[1])<=tol and abs(a[2]-b[2])<=tol
+
 class RawGraph:
     def __init__(self, vertices: List[List[float]], edges: List[List[int]]):
         self.vertices = vertices
@@ -58,16 +65,14 @@ class RawGraph:
 
     def edge_length(self, eid:int):
         u,v = self.edges[eid]
-        a = self.vertices[u]; b = self.vertices[v]
-        return math.dist(a,b)
+        return euclid(self.vertices[u], self.vertices[v])
 
-    def shortest_path(self, s:int, t:int, weighted:bool) -> Tuple[List[int], List[int], float]:
-        if s==t:
-            return [s],[ -1 ],0.0
+    def shortest_path(self, s:int, t:int, weighted: bool):
+        if s==t: return [s],[-1],0.0
         if weighted:
             import heapq
             dist=[float("inf")]*len(self.vertices)
-            prev=[(-1,-1)]*len(self.vertices) # (prevVertex, edgeId)
+            prev=[(-1,-1)]*len(self.vertices)
             dist[s]=0.0
             h=[(0.0,s)]
             while h:
@@ -78,51 +83,116 @@ class RawGraph:
                     w=self.edge_length(eid)
                     nd=cd+w
                     if nd<dist[v]:
-                        dist[v]=nd
-                        prev[v]=(u,eid)
+                        dist[v]=nd; prev[v]=(u,eid)
                         heapq.heappush(h,(nd,v))
-            if dist[t]==float("inf"):
-                return [],[],0.0
-            path=[]; ep=[]
+            if dist[t]==float("inf"): return [],[],0.0
+            path=[]; epath=[]
             cur=t
             while cur!=s:
                 p,eid=prev[cur]
-                path.append(cur)
-                ep.append(eid)
+                path.append(cur); epath.append(eid)
                 cur=p
-            path.append(s)
-            path.reverse()
-            ep.reverse()
-            return path,ep,dist[t]
+            path.append(s); path.reverse(); epath.reverse()
+            return path, epath, dist[t]
         else:
-            # BFS unweighted
-            q=deque([s])
-            prev={s:(-1,-1)}
+            q=deque([s]); prev={s:(-1,-1)}
             while q:
                 u=q.popleft()
                 if u==t: break
                 for (v,eid) in self.adj[u]:
                     if v not in prev:
-                        prev[v]=(u,eid)
-                        q.append(v)
-            if t not in prev:
-                return [],[],0.0
-            path=[]; ep=[]
-            cur=t
+                        prev[v]=(u,eid); q.append(v)
+            if t not in prev: return [],[],0.0
+            path=[]; epath=[]; cur=t
             while cur!=s:
                 p,eid=prev[cur]
-                path.append(cur); ep.append(eid)
+                path.append(cur); epath.append(eid)
                 cur=p
-            path.append(s)
-            path.reverse(); ep.reverse()
-            # length = sum of geometric lengths
-            length = sum(self.edge_length(eid) for eid in ep)
-            return path, ep, length
+            path.append(s); path.reverse(); epath.reverse()
+            length=sum(self.edge_length(eid) for eid in epath)
+            return path, epath, length
 
-# ------------------------------------------------------------------
-# Topologic build (no wire simplification)
-# ------------------------------------------------------------------
-def build_topologic(vertices: List[List[float]], edges: List[List[int]]):
+    def single_source_tree(self, s:int, weighted: bool):
+        """
+        Returns dist, prev arrays for all reachable vertices from s.
+        prev[v] = (parentVertex, edgeId)
+        """
+        if weighted:
+            import heapq
+            dist=[float("inf")]*len(self.vertices)
+            prev=[(-1,-1)]*len(self.vertices)
+            dist[s]=0.0
+            h=[(0.0,s)]
+            while h:
+                cd,u=heapq.heappop(h)
+                if cd>dist[u]: continue
+                for (v,eid) in self.adj[u]:
+                    w=self.edge_length(eid)
+                    nd=cd+w
+                    if nd<dist[v]:
+                        dist[v]=nd; prev[v]=(u,eid)
+                        heapq.heappush(h,(nd,v))
+            return dist, prev
+        else:
+            dist=[float("inf")]*len(self.vertices)
+            prev=[(-1,-1)]*len(self.vertices)
+            dist[s]=0.0
+            q=deque([s])
+            while q:
+                u=q.popleft()
+                for (v,eid) in self.adj[u]:
+                    if dist[v]==float("inf"):
+                        dist[v]=dist[u]+1
+                        prev[v]=(u,eid)
+                        q.append(v)
+            return dist, prev
+
+# Bridging fallback (unchanged from earlier version posting)
+def bridged_shortest_path(raw: RawGraph, start_idx: int, end_idx: int) -> Tuple[List[int], List[int], float]:
+    n = len(raw.vertices)
+    buckets = defaultdict(list)
+    for i,(x,y,z) in enumerate(raw.vertices):
+        key=(round(x/BRIDGING_XY_TOL), round(y/BRIDGING_XY_TOL))
+        buckets[key].append(i)
+    aug=[[] for _ in range(n)]
+    for u in range(n):
+        for (v,eid) in raw.adj[u]:
+            w=raw.edge_length(eid)
+            aug[u].append((v,eid,w,False))
+    for verts in buckets.values():
+        if len(verts)<2: continue
+        vs=sorted(verts, key=lambda i: raw.vertices[i][2])
+        for i in range(len(vs)-1):
+            a=vs[i]; b=vs[i+1]
+            w=abs(raw.vertices[a][2]-raw.vertices[b][2])
+            if w==0: continue
+            aug[a].append((b,-1,w,True))
+            aug[b].append((a,-1,w,True))
+    import heapq
+    dist=[float("inf")]*n; prev=[(-1,-1)]*n
+    dist[start_idx]=0.0; h=[(0.0,start_idx)]
+    while h:
+        cd,u=heapq.heappop(h)
+        if cd>dist[u]: continue
+        if u==end_idx: break
+        for (v,eid,w,synthetic) in aug[u]:
+            nd=cd+w
+            if nd<dist[v]:
+                dist[v]=nd; prev[v]=(u,eid)
+                heapq.heappush(h,(nd,v))
+    if dist[end_idx]==float("inf"):
+        return [],[],0.0
+    path=[]; eids=[]; cur=end_idx
+    while cur!=start_idx:
+        p,eid=prev[cur]
+        path.append(cur); eids.append(eid)
+        cur=p
+    path.append(start_idx); path.reverse(); eids.reverse()
+    return path, eids, dist[end_idx]
+
+# Topologic builder
+def build_topologic_graph(vertices: List[List[float]], edges: List[List[int]]):
+    if not USE_TOPOLOGIC: return None, []
     try:
         import topologicpy
         from topologicpy.Vertex import Vertex
@@ -131,240 +201,208 @@ def build_topologic(vertices: List[List[float]], edges: List[List[int]]):
         from topologicpy.Graph import Graph
         from topologicpy.Topology import Topology
     except Exception as e:
-        dprint("Topologic import failed:", e)
-        return None,[],[]
-
+        dprint("Topologic import failed:", e); return None, []
     vertex_objs=[Vertex.ByCoordinates(*c) for c in vertices]
     edge_objs=[]
     for (u,v) in edges:
-        try:
-            e = Edge.ByStartVertexEndVertex(vertex_objs[u], vertex_objs[v])
-            if USE_EDGE_WEIGHTS:
-                length = math.dist(vertices[u], vertices[v])
-                # assign length dictionary
-                try:
-                    Topology.SetDictionary(e, {EDGE_WEIGHT_KEY: length})
-                except Exception:
-                    pass
-            edge_objs.append(e)
-        except Exception as e:
-            dprint("Edge create fail", (u,v), e)
-
-    # Do NOT ask for topologyType="Wire" to avoid simplification
-    geom = vertex_objs + edge_objs
+        if 0 <= u < len(vertex_objs) and 0 <= v < len(vertex_objs):
+            try:
+                e=Edge.ByStartVertexEndVertex(vertex_objs[u], vertex_objs[v])
+                if USE_EDGE_WEIGHTS:
+                    length=euclid(vertices[u], vertices[v])
+                    try: Topology.SetDictionary(e,{EDGE_WEIGHT_KEY:length})
+                    except: pass
+                edge_objs.append(e)
+            except Exception as ex:
+                dprint("Edge create fail", (u,v), ex)
+    geom=vertex_objs+edge_objs
     topo=None
-    try:
-        topo = Topology.ByGeometry(geometry=geom, tolerance=TOLERANCE)
+    try: topo = Topology.ByGeometry(geometry=geom, tolerance=TOLERANCE)
     except TypeError:
-        try:
-            topo = Topology.ByGeometry(geom, TOLERANCE)
-        except Exception:
-            topo=None
+        try: topo = Topology.ByGeometry(geom, TOLERANCE)
+        except: topo=None
     if topo is None:
-        # fallback: structured (still may aggregate)
         topo = Topology.ByGeometry(vertices=vertices, edges=edges, faces=[], topologyType=None, tolerance=TOLERANCE)
-
     cluster = Cluster.ByTopologies([topo])
-    graph=None
+    try:
+        merged = Topology.SelfMerge(cluster)
+        if merged: cluster=merged
+    except Exception as e:
+        dprint("SelfMerge failed:", e)
     try:
         graph = Graph.ByTopology(cluster, tolerance=TOLERANCE)
-    except Exception as e:
-        dprint("Graph build failed:", e)
-        return None, vertex_objs, edge_objs
-    return graph, vertex_objs, edge_objs
+    except Exception as ex:
+        dprint("Graph build failed:", ex); graph=None
+    gvs=[]
+    if graph:
+        try: gvs = Graph.Vertices(graph) or []
+        except: gvs=[]
+    return graph, gvs
 
-def export_graph(graph, directory):
-    if not graph or not EXPORT_GRAPH_JSON: return
-    try:
-        from topologicpy.Graph import Graph
-        path=os.path.join(directory, GRAPH_EXPORT_FILENAME)
-        try:
-            Graph.ExportToJSON(graph, path, overwrite=OVERWRITE_GRAPH_EXPORT)
-        except TypeError:
-            if OVERWRITE_GRAPH_EXPORT and os.path.exists(path):
-                try: os.remove(path)
-                except: pass
-            Graph.ExportToJSON(graph, path)
-    except Exception as e:
-        dprint("Graph export failed:", e)
-
-# ------------------------------------------------------------------
-# Topologic path
-# ------------------------------------------------------------------
-def topo_shortest(graph, vertices_cache, start_coord, end_coord, use_weights:bool):
-    if not graph: 
-        return {"status":"no_graph"}
+def topo_shortest(graph, start_coord, end_coord, gvs):
+    if not (USE_TOPOLOGIC and graph): return {"status":"no_graph"}
     try:
         from topologicpy.Graph import Graph
         from topologicpy.Vertex import Vertex
         from topologicpy.Topology import Topology
     except:
         return {"status":"no_graph"}
-
-    gvs = vertices_cache or []
-    if not gvs:
-        try:
-            gvs = Graph.Vertices(graph) or []
-        except:
-            return {"status":"no_graph_vertices"}
-
     def map_coord(c):
         for gv in gvs:
-            if (abs(Vertex.X(gv)-c[0])<=SNAP_TOLERANCE and
-                abs(Vertex.Y(gv)-c[1])<=SNAP_TOLERANCE and
-                abs(Vertex.Z(gv)-c[2])<=SNAP_TOLERANCE):
+            if same_coord((Vertex.X(gv),Vertex.Y(gv),Vertex.Z(gv)), c, SNAP_TOLERANCE):
                 return gv
-        # nearest
         best=None; best_d2=1e100
+        x,y,z=c
         for gv in gvs:
-            d2=(Vertex.X(gv)-c[0])**2+(Vertex.Y(gv)-c[1])**2+(Vertex.Z(gv)-c[2])**2
+            d2=(Vertex.X(gv)-x)**2+(Vertex.Y(gv)-y)**2+(Vertex.Z(gv)-z)**2
             if d2<best_d2: best_d2=d2; best=gv
         return best
-
-    sv = map_coord(start_coord)
-    ev = map_coord(end_coord)
-    if not sv or not ev:
-        return {"status":"unmapped"}
-    if sv==ev:
-        return {"status":"same_vertex", "coords":[start_coord], "length":0.0}
-
-    edgeKey = EDGE_WEIGHT_KEY if use_weights else ""
-    try:
-        wire = Graph.ShortestPath(graph, sv, ev, "", edgeKey)
+    sv=map_coord(start_coord); ev=map_coord(end_coord)
+    if not sv or not ev: return {"status":"unmapped"}
+    if sv==ev: return {"status":"same_vertex","coords":[start_coord],"length":0.0}
+    edgeKey = EDGE_WEIGHT_KEY if USE_EDGE_WEIGHTS else ""
+    try: wire = Graph.ShortestPath(graph, sv, ev, "", edgeKey)
     except Exception as e:
-        dprint("Graph.ShortestPath error:", e)
-        wire=None
-    if not wire:
-        return {"status":"no_path"}
+        dprint("Graph.ShortestPath error:", e); wire=None
+    if not wire: return {"status":"no_path"}
     try:
         vs = Topology.Vertices(wire) or []
         coords=[(Vertex.X(v),Vertex.Y(v),Vertex.Z(v)) for v in vs]
-    except Exception:
-        coords=[]
-    if len(coords)<2:
-        return {"status":"no_path"}
-    length=sum(math.dist(coords[i-1],coords[i]) for i in range(1,len(coords)))
-    return {"status":"ok", "coords":coords, "length":length}
+    except: coords=[]
+    if len(coords)<2: return {"status":"no_path"}
+    length=sum(euclid(coords[i-1],coords[i]) for i in range(1,len(coords)))
+    return {"status":"ok","coords":coords,"length":length}
 
-# ------------------------------------------------------------------
-# Compare raw vs topologic paths
-# ------------------------------------------------------------------
-def compare_paths(raw_indices:List[int], topo_coords:List[Tuple[float,float,float]], vertices:List[List[float]]) -> bool:
-    if not raw_indices or not topo_coords: 
-        return False
-    # Convert raw indices to coords
-    raw_coords=[tuple(vertices[i]) for i in raw_indices]
-    # Normalizing lengths
-    if len(raw_coords)!=len(topo_coords):
-        return False
-    for a,b in zip(raw_coords, topo_coords):
-        if any(abs(a[i]-b[i])>SNAP_TOLERANCE for i in range(3)):
+def compare_paths(raw_indices, topo_coords, vertices):
+    if not raw_indices or not topo_coords: return False
+    if len(raw_indices)!=len(topo_coords): return False
+    for rid,c in zip(raw_indices, topo_coords):
+        vx,vy,vz = vertices[rid]
+        if (abs(vx-c[0])>SNAP_TOLERANCE or abs(vy-c[1])>SNAP_TOLERANCE or abs(vz-c[2])>SNAP_TOLERANCE):
             return False
     return True
 
-# ------------------------------------------------------------------
-# Sequence routing
-# ------------------------------------------------------------------
-def process_sequence(vertices, edges, starts, end_point):
+def process_sequence(vertices, edges, start_points, end_point):
     raw = RawGraph(vertices, edges)
-    graph = None; gvs=[]
-    if USE_TOPOLOGIC:
-        graph, _, _ = build_topologic(vertices, edges)
-        if graph:
-            from topologicpy.Graph import Graph as TG
-            try:
-                gvs = TG.Vertices(graph) or []
-            except:
-                gvs=[]
 
-    ordered = sorted(starts, key=lambda s: s.get("seq_index",0))
-    legs=[]
-    success=0
-    failed=0
-    cumulative=[]
-
-    def coord_to_index(c):
-        idx, d = raw.nearest_vertex(c)
-        exact = d <= SNAP_TOLERANCE
-        return idx, exact, d
-
-    for i in range(len(ordered)-1):
-        a=ordered[i]; b=ordered[i+1]
-        ac=tuple(a["point"]); bc=tuple(b["point"])
-        ai, a_exact, a_snap = coord_to_index(ac)
-        bi, b_exact, b_snap = coord_to_index(bc)
-
-        raw_path, raw_edges, raw_len = raw.shortest_path(ai, bi, RAW_USE_WEIGHTS)
-        if raw_path:
-            success += 1
-            raw_coords=[vertices[j] for j in raw_path]
-            if cumulative: cumulative.extend(raw_coords[1:])
-            else: cumulative.extend(raw_coords)
-        else:
-            failed += 1
-            raw_coords=[]; raw_len=0.0
-
-        topo_info={"status":"skipped"}
-        if USE_TOPOLOGIC:
-            topo_info = topo_shortest(graph, gvs, ac, bc, USE_EDGE_WEIGHTS)
-        matched = False
-        if topo_info.get("status")=="ok":
-            matched = compare_paths(raw_path, topo_info.get("coords",[]), vertices)
-            if REQUIRE_MATCH and not matched:
-                topo_info["status"]="mismatch_discarded"
-
-        legs.append({
-            "leg_type":"sequence",
-            "from_seq_index":a.get("seq_index"),
-            "to_seq_index":b.get("seq_index"),
-            "from_element_id":a.get("element_id"),
-            "to_element_id":b.get("element_id"),
-            "raw_vertex_indices": raw_path,
-            "raw_edge_indices": raw_edges,
-            "raw_length": raw_len,
-            "raw_success": bool(raw_path),
-            "topologic_status": topo_info.get("status"),
-            "topologic_length": topo_info.get("length"),
-            "topologic_coords": topo_info.get("coords"),
-            "topologic_matches_raw": matched,
-            "start_exact": a_exact,
-            "end_exact": b_exact,
-            "start_snap_distance": a_snap,
-            "end_snap_distance": b_snap
+    mapped_starts=[]
+    for sp in start_points:
+        idx,snap=raw.nearest_vertex(sp["point"])
+        mapped_starts.append({
+            "seq_index": sp["seq_index"],
+            "element_id": sp["element_id"],
+            "point": sp["point"],
+            "raw_index": idx,
+            "snap_dist": snap,
+            "exact": snap<=SNAP_TOLERANCE
         })
 
-    # Final leg to end
-    if ordered:
-        last=ordered[-1]
-        lc=tuple(last["point"])
-        ec=tuple(end_point)
-        li, l_exact, l_snap = coord_to_index(lc)
-        ei, e_exact, e_snap = coord_to_index(ec)
+    end_idx, end_snap = raw.nearest_vertex(end_point)
+    end_exact = end_snap <= SNAP_TOLERANCE
 
-        raw_path, raw_edges, raw_len = raw.shortest_path(li, ei, RAW_USE_WEIGHTS)
-        if raw_path:
-            success += 1
-            raw_coords=[vertices[j] for j in raw_path]
-            if cumulative: cumulative.extend(raw_coords[1:])
-            else: cumulative.extend(raw_coords)
+    graph=None; gvs=[]
+    if USE_TOPOLOGIC:
+        graph,gvs = build_topologic_graph(vertices, edges)
+
+    legs=[]; success=0; failed=0; cumulative=[]
+
+    def register(path_indices):
+        coords=[vertices[i] for i in path_indices]
+        if cumulative:
+            cumulative.extend(coords[1:])
         else:
-            failed += 1
-            raw_coords=[]; raw_len=0.0
+            cumulative.extend(coords)
+        return coords
+
+    def reconstruct(prev, s, t):
+        path=[]; epath=[]
+        cur=t
+        while cur!=s:
+            p,eid=prev[cur]
+            if p==-1: return [],[]
+            path.append(cur); epath.append(eid)
+            cur=p
+        path.append(s); path.reverse(); epath.reverse()
+        return path, epath
+
+    def build_leg(a, tgt_idx, tgt_coord, to_seq=None, final=False):
+        nonlocal success, failed
+        si=a["raw_index"]; ei=tgt_idx
+        raw_path, raw_edges, raw_len = raw.shortest_path(si, ei, RAW_WEIGHTED)
+        bridging_used=False; bridging_reason=None
+        stub_used=False; stub_reason=None
+
+        # Vertical bridging if enabled
+        if not raw_path and ENABLE_VERTICAL_BRIDGING_FALLBACK and (final or BRIDGING_ALLOW_ALL_LEGS):
+            b_path,b_edges,b_len = bridged_shortest_path(raw, si, ei)
+            if b_path:
+                raw_path=b_path; raw_edges=b_edges; raw_len=b_len
+                bridging_used=True; bridging_reason="vertical_bridging"
+
+        # Final stub fallback
+        if final and not raw_path and ENABLE_FINAL_STUB_FALLBACK:
+            # Multi-source Dijkstra from si
+            dist, prev = raw.single_source_tree(si, RAW_WEIGHTED)
+            # Collect reachable vertices
+            reachable=[i for i,dv in enumerate(dist) if dv<float("inf")]
+            if reachable:
+                # Pick reachable vertex closest to end point in straight line
+                best_v=None; best_d=1e100
+                for v in reachable:
+                    d=euclid(vertices[v], end_point)
+                    if d<best_d:
+                        best_d=d; best_v=v
+                if best_v is not None:
+                    path_r, edges_r = reconstruct(prev, si, best_v)
+                    if path_r:
+                        tail_len = euclid(vertices[best_v], end_point)
+                        # Accept even if tail_len==0 (snap)
+                        raw_path=path_r
+                        raw_edges=edges_r
+                        raw_len=sum(raw.edge_length(eid) for eid in raw_edges if eid>=0)+tail_len
+                        # Append a synthetic marker for tail (not a graph edge)
+                        raw_edges.append(STUB_SENTINEL_EDGE_ID)
+                        # Add synthetic coordinate (end point) to vertex path xyz only (below)
+                        stub_used=True; stub_reason="synthetic_stub"
+            # If still nothing, last resort: direct stub from start
+            if not raw_path:
+                tail_len = euclid(vertices[si], end_point)
+                raw_path=[si]
+                raw_edges=[STUB_SENTINEL_EDGE_ID]
+                raw_len=tail_len
+                stub_used=True; stub_reason="direct_stub"
+
+        if not raw_path and si==ei:
+            raw_path=[si]; raw_edges=[-1]; raw_len=0.0
+
+        raw_coords=[]
+        if raw_path:
+            success+=1
+            raw_coords=register(raw_path)
+            # If stub tail added and last coordinate != end_point add it
+            if (stub_used and (not raw_coords or not same_coord(raw_coords[-1], end_point, SNAP_TOLERANCE))):
+                raw_coords.append(list(end_point))
+                cumulative.append(list(end_point))
+        else:
+            failed+=1
+            raw_len=0.0
 
         topo_info={"status":"skipped"}
         if USE_TOPOLOGIC:
-            topo_info = topo_shortest(graph, gvs, lc, ec, USE_EDGE_WEIGHTS)
+            topo_info = topo_shortest(graph, a["point"], tgt_coord, gvs)
         matched=False
         if topo_info.get("status")=="ok":
-            matched = compare_paths(raw_path, topo_info.get("coords",[]), vertices)
+            matched=compare_paths(raw_path, topo_info.get("coords",[]), vertices)
             if REQUIRE_MATCH and not matched:
                 topo_info["status"]="mismatch_discarded"
 
         legs.append({
-            "leg_type":"final_to_end",
-            "from_seq_index": last.get("seq_index"),
-            "to_end": True,
-            "from_element_id": last.get("element_id"),
+            "leg_type":"final_to_end" if final else "sequence",
+            "from_seq_index": a["seq_index"],
+            "to_seq_index": None if final else to_seq,
+            "to_end": True if final else None,
+            "from_element_id": a["element_id"],
+            "to_element_id": None,
             "raw_vertex_indices": raw_path,
             "raw_edge_indices": raw_edges,
             "raw_length": raw_len,
@@ -373,59 +411,104 @@ def process_sequence(vertices, edges, starts, end_point):
             "topologic_length": topo_info.get("length"),
             "topologic_coords": topo_info.get("coords"),
             "topologic_matches_raw": matched,
-            "start_exact": l_exact,
-            "end_exact": e_exact,
-            "start_snap_distance": l_snap,
-            "end_snap_distance": e_snap
+            "start_exact": a["exact"],
+            "end_exact": end_exact if final else None,
+            "start_snap_distance": a["snap_dist"],
+            "end_snap_distance": end_snap if final else None,
+            "vertex_path_xyz": raw_coords,
+            "bridging_used": bridging_used or None,
+            "bridging_reason": bridging_reason,
+            "stub_used": stub_used or None,
+            "stub_reason": stub_reason
         })
+
+    for i in range(len(mapped_starts)-1):
+        a=mapped_starts[i]; b=mapped_starts[i+1]
+        build_leg(a, b["raw_index"], b["point"], to_seq=b["seq_index"], final=False)
+
+    if mapped_starts:
+        last=mapped_starts[-1]
+        build_leg(last, end_idx, end_point, final=True)
 
     return {
         "legs": legs,
         "total_length_raw": sum(l["raw_length"] for l in legs),
-        "successful_raw_legs": sum(1 for l in legs if l["raw_success"]),
-        "failed_raw_legs": sum(1 for l in legs if not l["raw_success"]),
+        "successful_raw_legs": success,
+        "failed_raw_legs": failed,
         "cumulative_vertex_path_xyz": cumulative
-    }, graph
+    }
 
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
 def process(input_path: str, output_path: str):
     start_time=time.time()
     data = load_json(input_path)
-    vertices = data.get("vertices", [])
-    edges = data.get("edges") or data.get("infra_edges") or []
-    if not vertices or not edges:
-        raise ValueError("Missing vertices or edges in JSON.")
-    start_points = data.get("start_points", [])
+
+    base_vertices = list(data.get("vertices", []))
+    if not base_vertices: raise ValueError("No vertices in JSON.")
+
+    infra_edges = data.get("infra_edges") or []
+    primary_edges = data.get("edges") or []
+    device_edges = data.get("device_edges") or []
+
+    if PREFER_INFRA_EDGES and infra_edges:
+        merged = infra_edges + device_edges
+    else:
+        merged = primary_edges + device_edges
+
+    seen=set(); base_edges=[]
+    for e in merged:
+        if not isinstance(e,(list,tuple)) or len(e)!=2: continue
+        a,b=e; key=(a,b) if a<b else (b,a)
+        if key in seen: continue
+        seen.add(key)
+        base_edges.append([a,b])
+
+    if not base_edges:
+        raise ValueError("No edges after merge.")
+
     end_point = data.get("end_point")
-    if not end_point or len(end_point)!=3:
-        raise ValueError("end_point missing or malformed")
+    if not end_point or len(end_point)!=3: raise ValueError("end_point missing or malformed")
+    end_point = tuple(map(float,end_point))
 
-    seq_data, graph = process_sequence(vertices, edges, start_points, end_point)
-    export_graph(graph, os.path.dirname(input_path))
-    version = getattr(sys.modules.get("topologicpy",""),"__version__","unknown")
+    if INCLUDE_END_POINT_VERTEX and not any(same_coord(tuple(v), end_point, SNAP_TOLERANCE) for v in base_vertices):
+        base_vertices.append(list(end_point))
+        dprint("End point appended index={}".format(len(base_vertices)-1))
 
-    # Evaluate topologic path usage stats
-    topo_ok = sum(1 for l in seq_data["legs"] if l["topologic_status"]=="ok")
-    topo_match = sum(1 for l in seq_data["legs"] if l.get("topologic_matches_raw"))
+    start_points=[]
+    for sp in data.get("start_points", []):
+        pt=sp.get("point")
+        if not pt or len(pt)!=3: continue
+        start_points.append({
+            "seq_index": sp.get("seq_index"),
+            "element_id": sp.get("element_id"),
+            "point": tuple(map(float, pt))
+        })
+    if start_points and all(p["seq_index"] is not None for p in start_points):
+        start_points.sort(key=lambda s: s["seq_index"])
+
+    seq_data = process_sequence(base_vertices, base_edges, start_points, end_point) if start_points else {
+        "legs":[], "total_length_raw":0.0,"successful_raw_legs":0,"failed_raw_legs":0,"cumulative_vertex_path_xyz":[]
+    }
+
+    version = getattr(sys.modules.get("topologicpy",""),"__version__","unknown") if USE_TOPOLOGIC else "raw_only"
     meta = {
         "version": version,
         "tolerance": TOLERANCE,
         "snap_tolerance": SNAP_TOLERANCE,
-        "vertices_input": len(vertices),
-        "edges_input": len(edges),
+        "vertices_input": len(base_vertices),
+        "edges_input": len(base_edges),
         "start_points": len(start_points),
         "legs": len(seq_data["legs"]),
         "raw_success_legs": seq_data["successful_raw_legs"],
         "raw_failed_legs": seq_data["failed_raw_legs"],
         "raw_total_length": seq_data["total_length_raw"],
         "topologic_enabled": USE_TOPOLOGIC,
-        "topologic_ok_legs": topo_ok,
-        "topologic_match_raw_legs": topo_match,
         "edge_weights": USE_EDGE_WEIGHTS,
-        "raw_weighted": RAW_USE_WEIGHTS,
+        "raw_weighted": RAW_WEIGHTED,
+        "prefer_infra_edges": PREFER_INFRA_EDGES,
         "require_match": REQUIRE_MATCH,
+        "include_end_point_vertex": INCLUDE_END_POINT_VERTEX,
+        "vertical_bridging_fallback": ENABLE_VERTICAL_BRIDGING_FALLBACK,
+        "final_stub_fallback": ENABLE_FINAL_STUB_FALLBACK,
         "duration_sec": time.time()-start_time
     }
 
@@ -445,7 +528,7 @@ def resolve_paths():
     else:
         ip=os.path.join(script_dir, DEFAULT_JSON_INPUT_FILENAME)
     if not os.path.isfile(ip):
-        raise FileNotFoundError(f"Input JSON not found: {ip}")
+        raise FileNotFoundError("Input JSON not found: {}".format(ip))
     op=os.path.join(os.path.dirname(ip), JSON_OUTPUT_FILENAME)
     return ip, op
 
@@ -453,5 +536,5 @@ if __name__=="__main__":
     in_path, out_path = resolve_paths()
     payload = process(in_path, out_path)
     m=payload["meta"]
-    print(f"Legs={m['legs']} raw_ok={m['raw_success_legs']} raw_fail={m['raw_failed_legs']} "
-          f"topo_ok={m['topologic_ok_legs']} topo_match_raw={m['topologic_match_raw_legs']} Output={out_path}")
+    print("Sequence legs={} raw_ok={} raw_fail={} stub_fallback={} Output={}".format(
+        m["legs"], m["raw_success_legs"], m["raw_failed_legs"], m.get("final_stub_fallback"), out_path))
